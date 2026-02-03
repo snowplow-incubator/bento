@@ -40,17 +40,19 @@ const (
 	kiFieldEnhancedFanOut  = "enhanced_fan_out"
 
 	// Enhanced Fan Out Fields
-	kiEFOFieldEnabled         = "enabled"
-	kiEFOFieldConsumerName    = "consumer_name"
-	kiEFOFieldConsumerARN     = "consumer_arn"
-	kiEFOFieldRecordBufferCap = "record_buffer_cap"
+	kiEFOFieldEnabled          = "enabled"
+	kiEFOFieldConsumerName     = "consumer_name"
+	kiEFOFieldConsumerARN      = "consumer_arn"
+	kiEFOFieldRecordBufferCap  = "record_buffer_cap"
+	kiEFOFieldMessageBufferCap = "message_buffer_cap"
 )
 
 type kiEFOConfig struct {
-	Enabled         bool
-	ConsumerName    string
-	ConsumerARN     string
-	RecordBufferCap int
+	Enabled          bool
+	ConsumerName     string
+	ConsumerARN      string
+	RecordBufferCap  int
+	MessageBufferCap int
 }
 
 type kiConfig struct {
@@ -105,6 +107,13 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 		}
 		if efoConf.RecordBufferCap < 0 {
 			err = errors.New("enhanced_fan_out.record_buffer_cap must be at least 0")
+			return
+		}
+		if efoConf.MessageBufferCap, err = efoNs.FieldInt(kiEFOFieldMessageBufferCap); err != nil {
+			return
+		}
+		if efoConf.MessageBufferCap < 0 {
+			err = errors.New("enhanced_fan_out.message_buffer_cap must be at least 0")
 			return
 		}
 		conf.EnhancedFanOut = efoConf
@@ -191,6 +200,10 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 			service.NewIntField(kiEFOFieldRecordBufferCap).
 				Description("Buffer capacity for the internal records channel per shard. Lower values reduce memory usage when processing many shards. Set to 0 for unbuffered channel (minimal memory footprint).").
 				Default(0).
+				Advanced(),
+			service.NewIntField(kiEFOFieldMessageBufferCap).
+				Description("Buffer capacity for the message channel that feeds batches to the pipeline. Higher values allow more batches to be queued while the pipeline processes, improving throughput at the cost of memory. Set to 0 for unbuffered (synchronous) behavior.").
+				Default(64).
 				Advanced(),
 		).
 			Description("Enhanced Fan Out configuration for push-based streaming. Provides dedicated 2 MB/sec throughput per consumer per shard and lower latency (~70ms). Note: EFO incurs per shard-hour charges.").
@@ -950,7 +963,13 @@ func (k *kinesisReader) Connect(ctx context.Context) error {
 
 	k.svc = svc
 	k.checkpointer = checkpointer
-	k.msgChan = make(chan asyncMessage)
+
+	// Create message channel with buffer capacity from EFO config (if enabled), otherwise unbuffered
+	msgBufferCap := 0
+	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.Enabled {
+		msgBufferCap = k.conf.EnhancedFanOut.MessageBufferCap
+	}
+	k.msgChan = make(chan asyncMessage, msgBufferCap)
 
 	if err = k.waitUntilStreamsExists(ctx); err != nil {
 		return err
