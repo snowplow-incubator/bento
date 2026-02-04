@@ -179,12 +179,6 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 	// Buffer for pending records from the subscription
 	var pending []types.Record
 
-	// Maximum pending records before applying backpressure
-	maxPendingRecords := 10000
-	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.MaxPendingRecords > 0 {
-		maxPendingRecords = k.conf.EnhancedFanOut.MaxPendingRecords
-	}
-
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
 	subscriptionTrigger <- startingSequence     // Start with initial sequence
@@ -201,6 +195,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			recordBatcher.Close(context.Background(), state == awsKinesisConsumerFinished)
 			boff.Reset()
 			k.boffPool.Put(boff)
+
+			// Release any remaining pending records back to the global pool
+			if len(pending) > 0 {
+				k.globalPendingPool.Release(len(pending))
+			}
 
 			reason := ""
 			switch state {
@@ -309,7 +308,10 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 							break
 						}
 					}
-					pending = pending[i+1:]
+					// Release processed records back to the global pool
+					processedCount := i + 1
+					k.globalPendingPool.Release(processedCount)
+					pending = pending[processedCount:]
 				}
 			}
 
@@ -320,12 +322,9 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				nextFlushChan = nil
 			}
 
-			// Decide whether to receive (based on pending buffer capacity)
-			if len(pending) < maxPendingRecords {
-				nextRecordsChan = recordsChan
-			} else {
-				nextRecordsChan = nil
-			}
+			// Always listen for records - backpressure is applied in efoSubscribeAndStream
+			// via globalPendingPool.Acquire() before sending to recordsChan
+			nextRecordsChan = recordsChan
 
 			if nextTimedBatchChan == nil {
 				if tNext, exists := recordBatcher.UntilNext(); exists {
@@ -365,6 +364,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 
 			case records := <-nextRecordsChan:
 				// Received records from subscription
+				// Space was already acquired in efoSubscribeAndStream before sending
 				pending = append(pending, records...)
 				boff.Reset()
 
@@ -466,7 +466,24 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 	continuationSeq := ""
 	lastReceivedSeq := ""
 	shardFinished := false
-	for event := range eventStream.Events() {
+	eventsChan := eventStream.Events()
+	for {
+		// Wait for space in the global pool before fetching the next event
+		// This applies backpressure to Kinesis before data enters memory
+		if !k.globalPendingPool.WaitForSpace(ctx) {
+			// Context cancelled
+			if continuationSeq == "" {
+				continuationSeq = lastReceivedSeq
+			}
+			return continuationSeq, false, ctx.Err()
+		}
+
+		// Now fetch the next event
+		event, ok := <-eventsChan
+		if !ok {
+			break
+		}
+
 		switch e := event.(type) {
 		case *types.SubscribeToShardEventStreamMemberSubscribeToShardEvent:
 			// Got records event
@@ -474,6 +491,15 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 
 			// Send records to channel and track last received sequence
 			if len(shardEvent.Records) > 0 {
+				// Acquire the actual space for this batch
+				if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records)) {
+					// Context cancelled, return with current sequence
+					if continuationSeq == "" {
+						continuationSeq = lastReceivedSeq
+					}
+					return continuationSeq, false, ctx.Err()
+				}
+
 				// Track the last record's sequence number for fallback
 				lastRecord := shardEvent.Records[len(shardEvent.Records)-1]
 				if lastRecord.SequenceNumber != nil {
@@ -482,6 +508,8 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 				select {
 				case recordsChan <- shardEvent.Records:
 				case <-ctx.Done():
+					// Release the acquired space since we couldn't send
+					k.globalPendingPool.Release(len(shardEvent.Records))
 					// Use lastReceivedSeq as fallback if continuationSeq not set
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
