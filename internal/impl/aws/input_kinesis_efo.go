@@ -179,12 +179,6 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 	// Buffer for pending records from the subscription
 	var pending []types.Record
 
-	// Maximum pending records before applying backpressure
-	maxPendingRecords := 10000
-	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.MaxPendingRecords > 0 {
-		maxPendingRecords = k.conf.EnhancedFanOut.MaxPendingRecords
-	}
-
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
 	subscriptionTrigger <- startingSequence     // Start with initial sequence
@@ -201,6 +195,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			recordBatcher.Close(context.Background(), state == awsKinesisConsumerFinished)
 			boff.Reset()
 			k.boffPool.Put(boff)
+
+			// Release any remaining pending records back to the global pool
+			if len(pending) > 0 {
+				k.globalPendingPool.Release(len(pending))
+			}
 
 			reason := ""
 			switch state {
@@ -309,7 +308,10 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 							break
 						}
 					}
-					pending = pending[i+1:]
+					// Release processed records back to the global pool
+					processedCount := i + 1
+					k.globalPendingPool.Release(processedCount)
+					pending = pending[processedCount:]
 				}
 			}
 
@@ -320,8 +322,8 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				nextFlushChan = nil
 			}
 
-			// Decide whether to receive (based on pending buffer capacity)
-			if len(pending) < maxPendingRecords {
+			// Decide whether to receive (based on global pending pool capacity)
+			if k.globalPendingPool.CanAcquire() {
 				nextRecordsChan = recordsChan
 			} else {
 				nextRecordsChan = nil
@@ -364,8 +366,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				pendingMsg = asyncMessage{}
 
 			case records := <-nextRecordsChan:
-				// Received records from subscription
-				pending = append(pending, records...)
+				// Received records from subscription - acquire space from global pool
+				// This blocks until space is available or context is cancelled
+				if k.globalPendingPool.Acquire(k.ctx, len(records)) {
+					pending = append(pending, records...)
+				}
 				boff.Reset()
 
 			case err := <-errorsChan:
