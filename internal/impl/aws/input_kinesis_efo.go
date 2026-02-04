@@ -179,6 +179,12 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 	// Buffer for pending records from the subscription
 	var pending []types.Record
 
+	// Maximum pending records before applying backpressure
+	maxPendingRecords := 10000
+	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.MaxPendingRecords > 0 {
+		maxPendingRecords = k.conf.EnhancedFanOut.MaxPendingRecords
+	}
+
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
 	subscriptionTrigger <- startingSequence     // Start with initial sequence
@@ -307,16 +313,18 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				}
 			}
 
+			// Decide whether to flush
 			if pendingMsg.msg != nil {
 				nextFlushChan = k.msgChan
-				nextRecordsChan = nil
 			} else {
 				nextFlushChan = nil
-				if len(pending) == 0 {
-					nextRecordsChan = recordsChan
-				} else {
-					nextRecordsChan = nil
-				}
+			}
+
+			// Decide whether to receive (based on pending buffer capacity)
+			if len(pending) < maxPendingRecords {
+				nextRecordsChan = recordsChan
+			} else {
+				nextRecordsChan = nil
 			}
 
 			if nextTimedBatchChan == nil {

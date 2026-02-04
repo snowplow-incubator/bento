@@ -40,17 +40,19 @@ const (
 	kiFieldEnhancedFanOut  = "enhanced_fan_out"
 
 	// Enhanced Fan Out Fields
-	kiEFOFieldEnabled         = "enabled"
-	kiEFOFieldConsumerName    = "consumer_name"
-	kiEFOFieldConsumerARN     = "consumer_arn"
-	kiEFOFieldRecordBufferCap = "record_buffer_cap"
+	kiEFOFieldEnabled           = "enabled"
+	kiEFOFieldConsumerName      = "consumer_name"
+	kiEFOFieldConsumerARN       = "consumer_arn"
+	kiEFOFieldRecordBufferCap   = "record_buffer_cap"
+	kiEFOFieldMaxPendingRecords = "max_pending_records"
 )
 
 type kiEFOConfig struct {
-	Enabled         bool
-	ConsumerName    string
-	ConsumerARN     string
-	RecordBufferCap int
+	Enabled           bool
+	ConsumerName      string
+	ConsumerARN       string
+	RecordBufferCap   int
+	MaxPendingRecords int
 }
 
 type kiConfig struct {
@@ -105,6 +107,13 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 		}
 		if efoConf.RecordBufferCap < 0 {
 			err = errors.New("enhanced_fan_out.record_buffer_cap must be at least 0")
+			return
+		}
+		if efoConf.MaxPendingRecords, err = efoNs.FieldInt(kiEFOFieldMaxPendingRecords); err != nil {
+			return
+		}
+		if efoConf.MaxPendingRecords < 1 {
+			err = errors.New("enhanced_fan_out.max_pending_records must be at least 1")
 			return
 		}
 		conf.EnhancedFanOut = efoConf
@@ -191,6 +200,10 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 			service.NewIntField(kiEFOFieldRecordBufferCap).
 				Description("Buffer capacity for the internal records channel per shard. Lower values reduce memory usage when processing many shards. Set to 0 for unbuffered channel (minimal memory footprint).").
 				Default(0).
+				Advanced(),
+			service.NewIntField(kiEFOFieldMaxPendingRecords).
+				Description("Maximum number of records to buffer per shard before applying backpressure to the Kinesis subscription. Higher values improve throughput by allowing the shard to continue receiving data while processing, but increase memory usage. Memory usage per shard is approximately max_pending_records × average_record_size.").
+				Default(10000).
 				Advanced(),
 		).
 			Description("Enhanced Fan Out configuration for push-based streaming. Provides dedicated 2 MB/sec throughput per consumer per shard and lower latency (~70ms). Note: EFO incurs per shard-hour charges.").
