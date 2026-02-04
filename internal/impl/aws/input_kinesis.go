@@ -29,15 +29,16 @@ const (
 	kiddbFieldBillingMode        = "billing_mode"
 
 	// Kinesis Input Fields
-	kiFieldDynamoDB        = "dynamodb"
-	kiFieldStreams         = "streams"
-	kiFieldCheckpointLimit = "checkpoint_limit"
-	kiFieldCommitPeriod    = "commit_period"
-	kiFieldLeasePeriod     = "lease_period"
-	kiFieldRebalancePeriod = "rebalance_period"
-	kiFieldStartFromOldest = "start_from_oldest"
-	kiFieldBatching        = "batching"
-	kiFieldEnhancedFanOut  = "enhanced_fan_out"
+	kiFieldDynamoDB         = "dynamodb"
+	kiFieldStreams          = "streams"
+	kiFieldCheckpointLimit  = "checkpoint_limit"
+	kiFieldCommitPeriod     = "commit_period"
+	kiFieldLeasePeriod      = "lease_period"
+	kiFieldRebalancePeriod  = "rebalance_period"
+	kiFieldStartFromOldest  = "start_from_oldest"
+	kiFieldBatching         = "batching"
+	kiFieldEnhancedFanOut   = "enhanced_fan_out"
+	kiFieldMessageBufferCap = "message_buffer_cap"
 
 	// Enhanced Fan Out Fields
 	kiEFOFieldEnabled                 = "enabled"
@@ -56,14 +57,15 @@ type kiEFOConfig struct {
 }
 
 type kiConfig struct {
-	Streams         []string
-	DynamoDB        kiddbConfig
-	CheckpointLimit int
-	CommitPeriod    string
-	LeasePeriod     string
-	RebalancePeriod string
-	StartFromOldest bool
-	EnhancedFanOut  *kiEFOConfig
+	Streams          []string
+	DynamoDB         kiddbConfig
+	CheckpointLimit  int
+	CommitPeriod     string
+	LeasePeriod      string
+	RebalancePeriod  string
+	StartFromOldest  bool
+	MessageBufferCap int
+	EnhancedFanOut   *kiEFOConfig
 }
 
 func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, err error) {
@@ -88,6 +90,13 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 		return
 	}
 	if conf.StartFromOldest, err = pConf.FieldBool(kiFieldStartFromOldest); err != nil {
+		return
+	}
+	if conf.MessageBufferCap, err = pConf.FieldInt(kiFieldMessageBufferCap); err != nil {
+		return
+	}
+	if conf.MessageBufferCap < 0 {
+		err = errors.New("message_buffer_cap must be at least 0")
 		return
 	}
 	if pConf.Contains(kiFieldEnhancedFanOut) {
@@ -186,6 +195,10 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 		service.NewBoolField(kiFieldStartFromOldest).
 			Description("Whether to consume from the oldest message when a sequence does not yet exist for the stream.").
 			Default(true),
+		service.NewIntField(kiFieldMessageBufferCap).
+			Description("Buffer capacity for the message channel that feeds batches to the pipeline. Higher values allow more batches to be queued while the pipeline processes, improving throughput at the cost of memory. Applies to both standard and Enhanced Fan Out modes. Set to 0 for unbuffered (synchronous) behavior.").
+			Default(64).
+			Advanced(),
 		service.NewObjectField(kiFieldEnhancedFanOut,
 			service.NewBoolField(kiEFOFieldEnabled).
 				Description("Enable Enhanced Fan Out mode for push-based streaming with dedicated throughput.").
@@ -965,7 +978,7 @@ func (k *kinesisReader) Connect(ctx context.Context) error {
 
 	k.svc = svc
 	k.checkpointer = checkpointer
-	k.msgChan = make(chan asyncMessage)
+	k.msgChan = make(chan asyncMessage, k.conf.MessageBufferCap)
 
 	if err = k.waitUntilStreamsExists(ctx); err != nil {
 		return err
