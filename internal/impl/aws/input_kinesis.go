@@ -197,7 +197,7 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 			Default(true),
 		service.NewIntField(kiFieldMessageBufferCap).
 			Description("Buffer capacity for the message channel that feeds batches to the pipeline. Higher values allow more batches to be queued while the pipeline processes, improving throughput at the cost of memory. Applies to both standard and Enhanced Fan Out modes. Set to 0 for unbuffered (synchronous) behavior.").
-			Default(64).
+			Default(0).
 			Advanced(),
 		service.NewObjectField(kiFieldEnhancedFanOut,
 			service.NewBoolField(kiEFOFieldEnabled).
