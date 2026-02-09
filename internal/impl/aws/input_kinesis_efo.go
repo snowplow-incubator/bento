@@ -236,7 +236,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			bufferCap = k.conf.EnhancedFanOut.RecordBufferCap
 		}
 		recordsChan := make(chan []types.Record, bufferCap)
-		errorsChan := make(chan error, 1)
+		// Buffer size matches number of potential concurrent error sources.
+		// Needs to be large enough that the subscription goroutine never blocks
+		// waiting to send an error, which would prevent it from receiving
+		// resubscription triggers.
+		errorsChan := make(chan error, 8)
 		resubscribeChan := make(chan string, 1)
 		shardFinishedChan := make(chan struct{}, 1)
 
@@ -253,12 +257,43 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				default:
 				}
 				if err != nil {
+					// Try to send error to main loop for logging/backoff handling.
+					// Use non-blocking send to prevent deadlock - if channel is full,
+					// we handle retry ourselves with a small delay.
 					select {
 					case <-k.ctx.Done():
 						return
 					case errorsChan <- err:
+						// Error sent, main loop will handle backoff and resubscription
+						continue
+					default:
+						// Channel full - main loop is busy processing another error.
+						// We handle retry ourselves with a small delay to avoid tight loop.
+						k.log.Debugf("Error channel full for shard %v, handling retry locally: %v", shardID, err)
+						select {
+						case <-k.ctx.Done():
+							return
+						case <-time.After(500 * time.Millisecond):
+							// Continue to receive from subscriptionTrigger or retry with current sequence
+						}
+						// Re-queue ourselves for retry by continuing the loop with same sequence
+						// But we need the sequence... let's get it from continuationSeq
+						nextSeq := continuationSeq
+						if nextSeq == "" {
+							nextSeq = sequence // Use the sequence we were called with
+						}
+						// Put it back on the trigger channel (non-blocking to avoid another deadlock)
+						select {
+						case subscriptionTrigger <- nextSeq:
+						case <-k.ctx.Done():
+							return
+						default:
+							// Channel has a pending trigger already, that's fine
+						}
+						continue
 					}
-				} else if shardFinished {
+				}
+				if shardFinished {
 					// Shard is closed, signal to main loop
 					// Don't resubscribe to closed shards
 					select {
