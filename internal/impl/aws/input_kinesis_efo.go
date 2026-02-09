@@ -15,6 +15,10 @@ import (
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
+// errBackpressureTimeout is returned when WaitForSpace times out due to sustained backpressure.
+// This is a retryable error that should trigger a backoff before resubscribing.
+var errBackpressureTimeout = errors.New("backpressure timeout waiting for space in pending pool")
+
 // kinesisEFOManager handles Enhanced Fan Out consumer registration and lifecycle
 type kinesisEFOManager struct {
 	streamARN    string
@@ -382,7 +386,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				}
 
 				// Retryable error - backoff and retry
-				k.log.Warnf("EFO subscription error for shard %v, will retry: %v", shardID, err)
+				if errors.Is(err, errBackpressureTimeout) {
+					k.log.Debugf("EFO backpressure timeout for shard %v, will retry after backoff", shardID)
+				} else {
+					k.log.Warnf("EFO subscription error for shard %v, will retry: %v", shardID, err)
+				}
 				backoffDuration := boff.NextBackOff()
 				sequence := recordBatcher.GetSequence()
 				time.AfterFunc(backoffDuration, func() {
@@ -484,13 +492,14 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 			}
 			return continuationSeq, false, ctx.Err()
 		case WaitForSpaceTimeout:
-			// Backpressure timeout - close subscription cleanly and let caller resubscribe
+			// Backpressure timeout - close subscription cleanly and return error to trigger backoff
 			// This prevents AWS from forcibly terminating the connection after extended inactivity
-			k.log.Debugf("Backpressure timeout for shard %v, closing subscription to resubscribe", shardID)
+			// and ensures we don't immediately resubscribe while backpressure persists
+			k.log.Debugf("Backpressure timeout for shard %v, closing subscription to resubscribe with backoff", shardID)
 			if continuationSeq == "" {
 				continuationSeq = lastReceivedSeq
 			}
-			return continuationSeq, false, nil
+			return continuationSeq, false, errBackpressureTimeout
 		case WaitForSpaceOK:
 			// Space available, continue
 		}
