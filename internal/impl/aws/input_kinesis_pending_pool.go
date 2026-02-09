@@ -54,19 +54,44 @@ func (p *globalPendingPool) Acquire(ctx context.Context, count int) bool {
 	return true
 }
 
+// WaitForSpaceResult indicates the outcome of WaitForSpace.
+type WaitForSpaceResult int
+
+const (
+	// WaitForSpaceOK indicates space is available.
+	WaitForSpaceOK WaitForSpaceResult = iota
+	// WaitForSpaceCancelled indicates the context was cancelled.
+	WaitForSpaceCancelled
+	// WaitForSpaceTimeout indicates the timeout was reached while waiting.
+	WaitForSpaceTimeout
+)
+
 // WaitForSpace blocks until there is any space available in the pool.
 // This is used to apply backpressure before fetching new data from Kinesis.
-// Returns false if the context is cancelled.
-func (p *globalPendingPool) WaitForSpace(ctx context.Context) bool {
+// Returns WaitForSpaceOK if space is available, WaitForSpaceCancelled if
+// context is cancelled, or WaitForSpaceTimeout if the timeout is reached.
+// A timeout of 0 means no timeout (wait indefinitely).
+func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Duration) WaitForSpaceResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// Track when we started waiting for timeout
+	var deadline time.Time
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
 
 	for p.current >= p.max {
 		// Check if context is cancelled before waiting
 		select {
 		case <-ctx.Done():
-			return false
+			return WaitForSpaceCancelled
 		default:
+		}
+
+		// Check if we've exceeded the timeout
+		if timeout > 0 && time.Now().After(deadline) {
+			return WaitForSpaceTimeout
 		}
 
 		// Wait for space to become available
@@ -74,12 +99,12 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context) bool {
 		select {
 		case <-ctx.Done():
 			p.mu.Lock()
-			return false
+			return WaitForSpaceCancelled
 		case <-time.After(10 * time.Millisecond): // Poll periodically
 			p.mu.Lock()
 		}
 	}
-	return true
+	return WaitForSpaceOK
 }
 
 // Release returns count records worth of space back to the pool.

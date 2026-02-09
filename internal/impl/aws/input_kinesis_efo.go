@@ -467,15 +467,32 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 	lastReceivedSeq := ""
 	shardFinished := false
 	eventsChan := eventStream.Events()
+
+	// Timeout for waiting on backpressure - if we wait too long, close the subscription
+	// cleanly and resubscribe rather than letting AWS forcibly terminate the connection.
+	// 30 seconds is well under the 5-minute EFO subscription timeout.
+	const backpressureTimeout = 30 * time.Second
+
 	for {
 		// Wait for space in the global pool before fetching the next event
 		// This applies backpressure to Kinesis before data enters memory
-		if !k.globalPendingPool.WaitForSpace(ctx) {
+		switch k.globalPendingPool.WaitForSpace(ctx, backpressureTimeout) {
+		case WaitForSpaceCancelled:
 			// Context cancelled
 			if continuationSeq == "" {
 				continuationSeq = lastReceivedSeq
 			}
 			return continuationSeq, false, ctx.Err()
+		case WaitForSpaceTimeout:
+			// Backpressure timeout - close subscription cleanly and let caller resubscribe
+			// This prevents AWS from forcibly terminating the connection after extended inactivity
+			k.log.Debugf("Backpressure timeout for shard %v, closing subscription to resubscribe", shardID)
+			if continuationSeq == "" {
+				continuationSeq = lastReceivedSeq
+			}
+			return continuationSeq, false, nil
+		case WaitForSpaceOK:
+			// Space available, continue
 		}
 
 		// Now fetch the next event
