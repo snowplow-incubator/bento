@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  localstack:
+    image: localstack/localstack
+    container_name: localstack-kinesis
+    environment:
+      - DEBUG=1
+      - SERVICES=kinesis,dynamodb
+      - LOCALSTACK_HOST=localhost:4566
+      - KINESIS_PROVIDER=kinesalite
+      - EAGER_SERVICE_LOADING=1
+    ports:
+      - "4566:4566"
+    volumes:
+      - "./init-aws.sh:/etc/localstack/init/ready.d/init-aws.sh"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10

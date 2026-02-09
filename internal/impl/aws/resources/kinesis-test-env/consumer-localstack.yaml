@@ -1,0 +1,56 @@
+# Bento Kinesis Consumer - LocalStack
+#
+# Setup:
+#   docker-compose up -d
+#   aws --endpoint-url=http://localhost:4566 --region us-east-1 kinesis create-stream --stream-name test-stream --shard-count 2
+#
+# Run:
+#   go build -o bento ./cmd/bento
+#   ./bento -c consumer-localstack.yaml
+#
+# Put records:
+#   aws --endpoint-url=http://localhost:4566 --region us-east-1 kinesis put-record \
+#       --stream-name test-stream --partition-key pk1 --data "hello" --cli-binary-format raw-in-base64-out
+#
+# List shards:
+#   aws --endpoint-url=http://localhost:4566 --region us-east-1 kinesis list-shards --stream-name test-stream
+#
+# Split shard:
+#   aws --endpoint-url=http://localhost:4566 --region us-east-1 kinesis split-shard \
+#       --stream-name test-stream --shard-to-split shardId-000000000000 \
+#       --new-starting-hash-key 85070591730234615865843651857942052863
+#
+# Clear checkpoints (to restart from beginning):
+#   aws --endpoint-url=http://localhost:4566 --region us-east-1 dynamodb delete-table --table-name kinesis-checkpoints
+
+input:
+  aws_kinesis:
+    endpoint: http://localhost:4566
+    streams:
+      - test-stream
+    region: us-east-1
+    checkpoint_limit: 64
+    commit_period: 5s
+    lease_period: 30s
+    rebalance_period: 10s
+    start_from_oldest: true
+    dynamodb:
+      table: kinesis-checkpoints
+      create: true
+    credentials:
+      id: test
+      secret: test
+      token: test
+
+pipeline:
+  processors:
+    - log:
+        level: INFO
+        message: "shard=${! meta(\"kinesis_shard\") } data=${! content() }"
+
+output:
+  drop: {}
+
+logger:
+  level: DEBUG
+  format: logfmt
