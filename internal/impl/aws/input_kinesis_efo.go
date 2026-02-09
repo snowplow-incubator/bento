@@ -387,11 +387,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				sequence := recordBatcher.GetSequence()
 				time.AfterFunc(backoffDuration, func() {
 					// Trigger resubscription after backoff, unless context has been cancelled
+					// Note: We block here (no default case) to ensure resubscription is not dropped
 					select {
 					case <-k.ctx.Done():
 						return
 					case subscriptionTrigger <- sequence:
-					default:
 					}
 				})
 
