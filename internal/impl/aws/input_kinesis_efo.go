@@ -248,73 +248,76 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 		subscriptionWg.Add(1)
 		go func() {
 			defer subscriptionWg.Done()
+
+			// Subscription goroutine manages its own backoff for retries
+			subBoff := backoff.NewExponentialBackOff()
+			subBoff.InitialInterval = 300 * time.Millisecond
+			subBoff.MaxInterval = 5 * time.Second
+			subBoff.MaxElapsedTime = 0 // Never stop retrying
+
 			for sequence := range subscriptionTrigger {
-				continuationSeq, shardFinished, err := k.efoSubscribeAndStream(k.ctx, info, shardID, sequence, recordsChan)
-				// Check if context was cancelled before attempting to send on any channels
-				select {
-				case <-k.ctx.Done():
-					return
-				default:
-				}
-				if err != nil {
-					// Try to send error to main loop for logging/backoff handling.
-					// Use non-blocking send to prevent deadlock - if channel is full,
-					// we handle retry ourselves with a small delay.
+				currentSeq := sequence
+
+				// Inner retry loop - keeps trying until success or context cancellation
+				for {
 					select {
 					case <-k.ctx.Done():
 						return
-					case errorsChan <- err:
-						// Error sent, main loop will handle backoff and resubscription
-						continue
 					default:
-						// Channel full - main loop is busy processing another error.
-						// We handle retry ourselves with a small delay to avoid tight loop.
-						k.log.Debugf("Error channel full for shard %v, handling retry locally: %v", shardID, err)
+					}
+
+					continuationSeq, shardFinished, err := k.efoSubscribeAndStream(k.ctx, info, shardID, currentSeq, recordsChan)
+
+					if err != nil {
+						// Log the error (non-blocking to prevent deadlock)
 						select {
-						case <-k.ctx.Done():
-							return
-						case <-time.After(500 * time.Millisecond):
-							// Continue to receive from subscriptionTrigger or retry with current sequence
-						}
-						// Re-queue ourselves for retry by continuing the loop with same sequence
-						// But we need the sequence... let's get it from continuationSeq
-						nextSeq := continuationSeq
-						if nextSeq == "" {
-							nextSeq = sequence // Use the sequence we were called with
-						}
-						// Put it back on the trigger channel (non-blocking to avoid another deadlock)
-						select {
-						case subscriptionTrigger <- nextSeq:
-						case <-k.ctx.Done():
-							return
+						case errorsChan <- err:
 						default:
-							// Channel has a pending trigger already, that's fine
+							// Channel full, just log locally
+							if errors.Is(err, errBackpressureTimeout) {
+								k.log.Debugf("EFO backpressure timeout for shard %v, will retry", shardID)
+							} else {
+								k.log.Warnf("EFO subscription error for shard %v (channel full), will retry: %v", shardID, err)
+							}
 						}
-						continue
+
+						// Update sequence for retry if we got a continuation
+						if continuationSeq != "" {
+							currentSeq = continuationSeq
+						}
+
+						// Backoff before retry
+						backoffDuration := subBoff.NextBackOff()
+						select {
+						case <-k.ctx.Done():
+							return
+						case <-time.After(backoffDuration):
+						}
+						continue // Retry the subscription
 					}
-				}
-				if shardFinished {
-					// Shard is closed, signal to main loop
-					// Don't resubscribe to closed shards
+
+					// Success - reset backoff
+					subBoff.Reset()
+
+					if shardFinished {
+						// Shard is closed, signal to main loop
+						select {
+						case shardFinishedChan <- struct{}{}:
+						default:
+						}
+						return
+					}
+
+					// Subscription completed normally, update sequence and notify main loop
+					if continuationSeq != "" {
+						currentSeq = continuationSeq
+					}
 					select {
 					case <-k.ctx.Done():
 						return
-					case shardFinishedChan <- struct{}{}:
-					default:
+					case resubscribeChan <- currentSeq:
 					}
-					return
-				} else {
-					// Schedule resubscription with continuation sequence
-					nextSeq := continuationSeq
-					if nextSeq == "" {
-						// Use latest checkpointed sequence
-						nextSeq = recordBatcher.GetSequence()
-					}
-					select {
-					case <-k.ctx.Done():
-						return
-					case resubscribeChan <- nextSeq:
-					}
+					break // Exit retry loop, wait for next trigger from main loop
 				}
 			}
 		}()
@@ -408,11 +411,14 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				boff.Reset()
 
 			case err := <-errorsChan:
-				// Subscription error occurred
+				// Subscription error received - log it.
+				// The subscription goroutine handles its own retry logic with backoff,
+				// so we don't need to trigger resubscription from here.
 				var resourceNotFound *types.ResourceNotFoundException
 				var invalidArg *types.InvalidArgumentException
 
 				if errors.As(err, &resourceNotFound) || errors.As(err, &invalidArg) {
+					// Non-retryable errors are still fatal
 					k.log.Errorf("Non-retryable EFO error for shard %v: %v", shardID, err)
 					state = awsKinesisConsumerClosing
 					close(subscriptionTrigger)
@@ -420,23 +426,13 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 					return
 				}
 
-				// Retryable error - backoff and retry
+				// Log retryable errors (subscription goroutine handles retry)
 				if errors.Is(err, errBackpressureTimeout) {
-					k.log.Debugf("EFO backpressure timeout for shard %v, will retry after backoff", shardID)
+					k.log.Debugf("EFO backpressure timeout for shard %v, subscription goroutine will retry", shardID)
 				} else {
-					k.log.Warnf("EFO subscription error for shard %v, will retry: %v", shardID, err)
+					k.log.Warnf("EFO subscription error for shard %v, subscription goroutine will retry: %v", shardID, err)
 				}
-				backoffDuration := boff.NextBackOff()
-				sequence := recordBatcher.GetSequence()
-				time.AfterFunc(backoffDuration, func() {
-					// Trigger resubscription after backoff, unless context has been cancelled
-					// Note: We block here (no default case) to ensure resubscription is not dropped
-					select {
-					case <-k.ctx.Done():
-						return
-					case subscriptionTrigger <- sequence:
-					}
-				})
+				boff.Reset() // Reset backoff since we received an error notification
 
 			case sequence := <-resubscribeChan:
 				// Subscription completed successfully, resubscribe immediately to maintain continuous data flow
