@@ -26,30 +26,41 @@ func newGlobalPendingPool(max int) *globalPendingPool {
 }
 
 // Acquire acquires space for count records, blocking if necessary until space is available.
-// Returns immediately if ctx is cancelled.
+// Returns false immediately if count > max (impossible to satisfy) or if ctx is cancelled.
 func (p *globalPendingPool) Acquire(ctx context.Context, count int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// If the requested count exceeds the pool's maximum capacity, it can never be satisfied.
+	// Return false immediately to avoid blocking indefinitely.
+	if count > p.max {
+		return false
+	}
+
+	// Start a goroutine to handle context cancellation by broadcasting to wake up waiters
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			p.cond.Broadcast()
+		case <-done:
+		}
+	}()
+
 	for p.current+count > p.max {
 		// Check if context is cancelled before waiting
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return false
-		default:
 		}
-
-		// Wait for space to become available
-		// We need to release the lock while waiting, so use a channel-based approach
-		p.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			p.mu.Lock()
-			return false
-		case <-time.After(10 * time.Millisecond): // Poll periodically
-			p.mu.Lock()
-		}
+		p.cond.Wait()
 	}
+
+	// Final check after waking up
+	if ctx.Err() != nil {
+		return false
+	}
+
 	p.current += count
 	return true
 }
@@ -75,18 +86,40 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Durat
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Track when we started waiting for timeout
+	// Set up deadline if timeout is specified
 	var deadline time.Time
+	var timer *time.Timer
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
+		timer = time.NewTimer(timeout)
+		defer timer.Stop()
 	}
+
+	// Start a goroutine to handle context cancellation and timeout by broadcasting
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		if timer != nil {
+			select {
+			case <-ctx.Done():
+				p.cond.Broadcast()
+			case <-timer.C:
+				p.cond.Broadcast()
+			case <-done:
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				p.cond.Broadcast()
+			case <-done:
+			}
+		}
+	}()
 
 	for p.current >= p.max {
 		// Check if context is cancelled before waiting
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return WaitForSpaceCancelled
-		default:
 		}
 
 		// Check if we've exceeded the timeout
@@ -94,16 +127,17 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Durat
 			return WaitForSpaceTimeout
 		}
 
-		// Wait for space to become available
-		p.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			p.mu.Lock()
-			return WaitForSpaceCancelled
-		case <-time.After(10 * time.Millisecond): // Poll periodically
-			p.mu.Lock()
-		}
+		p.cond.Wait()
 	}
+
+	// Final checks after waking up
+	if ctx.Err() != nil {
+		return WaitForSpaceCancelled
+	}
+	if timeout > 0 && time.Now().After(deadline) {
+		return WaitForSpaceTimeout
+	}
+
 	return WaitForSpaceOK
 }
 
@@ -114,7 +148,7 @@ func (p *globalPendingPool) Release(count int) {
 	if p.current < 0 {
 		p.current = 0
 	}
-	p.cond.Broadcast() // Wake up any waiting goroutines
+	p.cond.Broadcast()
 	p.mu.Unlock()
 }
 
