@@ -237,6 +237,20 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 		resubscribeChan := make(chan string, 1)
 		shardFinishedChan := make(chan struct{}, 1)
 
+		// drainRecordsChan drains any remaining records from recordsChan after
+		// the subscription goroutine has stopped, releasing their pool capacity.
+		// This prevents leaking pool capacity when the consumer exits with buffered records.
+		drainRecordsChan := func() {
+			for {
+				select {
+				case records := <-recordsChan:
+					k.globalPendingPool.Release(len(records))
+				default:
+					return
+				}
+			}
+		}
+
 		var subscriptionWg sync.WaitGroup
 		subscriptionWg.Add(1)
 		go func() {
@@ -266,11 +280,12 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 						var resourceNotFound *types.ResourceNotFoundException
 						var invalidArg *types.InvalidArgumentException
 						if errors.As(err, &resourceNotFound) || errors.As(err, &invalidArg) {
-							// Send to errorsChan for main loop to handle shutdown
+							// Send to errorsChan for main loop to handle shutdown.
+							// Use blocking send (with context) to ensure fatal errors are not dropped.
+							k.log.Errorf("Non-retryable EFO error for shard %v: %v", shardID, err)
 							select {
+							case <-k.ctx.Done():
 							case errorsChan <- err:
-							default:
-								k.log.Errorf("Non-retryable EFO error for shard %v: %v", shardID, err)
 							}
 							return // Stop retrying
 						}
@@ -337,6 +352,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 					if pendingMsg, _ = recordBatcher.FlushMessage(k.ctx); pendingMsg.msg == nil {
 						close(subscriptionTrigger)
 						subscriptionWg.Wait()
+						drainRecordsChan()
 						return
 					}
 				} else if recordBatcher.HasPendingMessage() {
@@ -386,6 +402,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 					state = awsKinesisConsumerClosing
 					close(subscriptionTrigger)
 					subscriptionWg.Wait()
+					drainRecordsChan()
 					return
 				}
 
@@ -400,6 +417,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 						state = awsKinesisConsumerYielding
 						close(subscriptionTrigger)
 						subscriptionWg.Wait()
+						drainRecordsChan()
 						return
 					}
 				}
@@ -428,6 +446,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 					state = awsKinesisConsumerClosing
 					close(subscriptionTrigger)
 					subscriptionWg.Wait()
+					drainRecordsChan()
 					return
 				}
 
@@ -453,6 +472,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				state = awsKinesisConsumerClosing
 				close(subscriptionTrigger)
 				subscriptionWg.Wait()
+				drainRecordsChan()
 				return
 			}
 		}
