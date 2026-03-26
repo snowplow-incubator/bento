@@ -196,6 +196,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 
 	// Buffer for pending records from the subscription
 	var pending []types.Record
+	var pendingBytes int
 
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
@@ -214,7 +215,7 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 
 			// Release any remaining pending records back to the global pool
 			if len(pending) > 0 {
-				k.globalPendingPool.Release(len(pending))
+				k.globalPendingPool.Release(len(pending), pendingBytes)
 			}
 
 			reason := ""
@@ -261,7 +262,11 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			for {
 				select {
 				case records := <-recordsChan:
-					k.globalPendingPool.Release(len(records))
+					drainBytes := 0
+					for _, r := range records {
+						drainBytes += len(r.Data)
+					}
+					k.globalPendingPool.Release(len(records), drainBytes)
 				default:
 					return
 				}
@@ -388,7 +393,12 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 					}
 					// Release processed records back to the global pool
 					processedCount := i + 1
-					k.globalPendingPool.Release(processedCount)
+					processedBytes := 0
+					for _, r := range pending[:processedCount] {
+						processedBytes += len(r.Data)
+					}
+					k.globalPendingPool.Release(processedCount, processedBytes)
+					pendingBytes -= processedBytes
 					pending = pending[processedCount:]
 				}
 			}
@@ -445,6 +455,9 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			case records := <-nextRecordsChan:
 				// Received records from subscription
 				// Space was already acquired in efoSubscribeAndStream before sending
+				for _, r := range records {
+					pendingBytes += len(r.Data)
+				}
 				pending = append(pending, records...)
 
 			case err := <-errorsChan:
@@ -523,6 +536,19 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 		}
 	}
 
+	// Acquire subscription slot if semaphore is configured
+	if k.subscriptionSem != nil {
+		k.subscriptionWaiters.Add(1)
+		select {
+		case <-k.subscriptionSem:
+			k.subscriptionWaiters.Add(-1)
+			defer func() { k.subscriptionSem <- struct{}{} }()
+		case <-ctx.Done():
+			k.subscriptionWaiters.Add(-1)
+			return "", false, ctx.Err()
+		}
+	}
+
 	k.log.Debugf("Subscribing to shard %v with sequence %v", shardID, startingSequence)
 
 	input := &kinesis.SubscribeToShardInput{
@@ -544,6 +570,13 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 	lastReceivedSeq := ""
 	shardFinished := false
 	eventsChan := eventStream.Events()
+
+	// Set up rotation timer if configured — yields the subscription slot for waiting
+	// shards, but only when at least one shard is actually blocked on the semaphore.
+	var rotationTimer <-chan time.Time
+	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.SubscriptionRotationPeriod > 0 {
+		rotationTimer = time.After(k.conf.EnhancedFanOut.SubscriptionRotationPeriod)
+	}
 
 	// Timeout for waiting on backpressure - if we wait too long, close the subscription
 	// cleanly and resubscribe rather than letting AWS forcibly terminate the connection.
@@ -573,6 +606,21 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 			// Space available, continue
 		}
 
+		// Check rotation timer — only yield if another shard is actually waiting for a slot
+		select {
+		case <-rotationTimer:
+			if k.subscriptionWaiters.Load() > 0 {
+				k.log.Debugf("Subscription rotation for shard %v, yielding slot for waiting shard", shardID)
+				if continuationSeq == "" {
+					continuationSeq = lastReceivedSeq
+				}
+				return continuationSeq, false, nil
+			}
+			// No shards waiting — reset timer and keep going
+			rotationTimer = time.After(k.conf.EnhancedFanOut.SubscriptionRotationPeriod)
+		default:
+		}
+
 		// Now fetch the next event
 		event, ok := <-eventsChan
 		if !ok {
@@ -586,8 +634,14 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 
 			// Send records to channel and track last received sequence
 			if len(shardEvent.Records) > 0 {
+				// Compute byte size for the batch
+				totalBytes := 0
+				for _, r := range shardEvent.Records {
+					totalBytes += len(r.Data)
+				}
+
 				// Acquire the actual space for this batch
-				if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records)) {
+				if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records), totalBytes) {
 					// Context cancelled, return with current sequence
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
@@ -604,7 +658,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 				case recordsChan <- shardEvent.Records:
 				case <-ctx.Done():
 					// Release the acquired space since we couldn't send
-					k.globalPendingPool.Release(len(shardEvent.Records))
+					k.globalPendingPool.Release(len(shardEvent.Records), totalBytes)
 					// Use lastReceivedSeq as fallback if continuationSeq not set
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq

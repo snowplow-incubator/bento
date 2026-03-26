@@ -6,34 +6,80 @@ import (
 	"time"
 )
 
-// globalPendingPool limits the total number of pending records across all shards.
-// Each shard must acquire space from this pool before accepting records from Kinesis,
-// ensuring bounded memory usage regardless of shard count.
+// globalPendingPool limits the total number of pending records (and optionally
+// bytes) across all shards. Each shard must acquire space from this pool before
+// accepting records from Kinesis, ensuring bounded memory usage regardless of
+// shard count.
+//
+// When maxBytes > 0, both the record count limit and the byte limit apply —
+// whichever is reached first triggers backpressure. When maxBytes == 0, only
+// the record count limit is enforced (backwards compatible).
 type globalPendingPool struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	current int
-	max     int
+	mu           sync.Mutex
+	cond         *sync.Cond
+	current      int
+	max          int
+	currentBytes int
+	maxBytes     int // 0 means byte limit disabled
 }
 
-// newGlobalPendingPool creates a new pool with the specified maximum capacity.
-func newGlobalPendingPool(maximum int) *globalPendingPool {
+// newGlobalPendingPool creates a new pool with the specified maximum record
+// count and optional maximum byte capacity. Set maxBytes to 0 to disable
+// byte-level accounting.
+func newGlobalPendingPool(maximum, maxBytes int) *globalPendingPool {
 	p := &globalPendingPool{
-		max: maximum,
+		max:      maximum,
+		maxBytes: maxBytes,
 	}
 	p.cond = sync.NewCond(&p.mu)
 	return p
 }
 
-// Acquire acquires space for count records, blocking if necessary until space is available.
-// Returns false immediately if count > max (impossible to satisfy) or if ctx is cancelled.
-func (p *globalPendingPool) Acquire(ctx context.Context, count int) bool {
+// isFull returns true when either limit is saturated (used by WaitForSpace).
+func (p *globalPendingPool) isFull() bool {
+	if p.current >= p.max {
+		return true
+	}
+	if p.maxBytes > 0 && p.currentBytes >= p.maxBytes {
+		return true
+	}
+	return false
+}
+
+// wouldExceed returns true when adding count records of the given byte size
+// would exceed either limit (used by Acquire).
+func (p *globalPendingPool) wouldExceed(count, bytes int) bool {
+	if p.current+count > p.max {
+		return true
+	}
+	if p.maxBytes > 0 && p.currentBytes+bytes > p.maxBytes {
+		return true
+	}
+	return false
+}
+
+// canNeverFit returns true when the request can never be satisfied regardless
+// of how much space is released.
+func (p *globalPendingPool) canNeverFit(count, bytes int) bool {
+	if count > p.max {
+		return true
+	}
+	if p.maxBytes > 0 && bytes > p.maxBytes {
+		return true
+	}
+	return false
+}
+
+// Acquire acquires space for count records totalling bytes, blocking if
+// necessary until space is available. Returns false immediately if the request
+// can never be satisfied (count > max or bytes > maxBytes) or if ctx is
+// cancelled.
+func (p *globalPendingPool) Acquire(ctx context.Context, count, bytes int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// If the requested count exceeds the pool's maximum capacity, it can never be satisfied.
-	// Return false immediately to avoid blocking indefinitely.
-	if count > p.max {
+	// If the request can never fit, return false immediately.
+	if p.canNeverFit(count, bytes) {
 		return false
 	}
 
@@ -48,7 +94,7 @@ func (p *globalPendingPool) Acquire(ctx context.Context, count int) bool {
 		}
 	}()
 
-	for p.current+count > p.max {
+	for p.wouldExceed(count, bytes) {
 		// Check if context is cancelled before waiting
 		if ctx.Err() != nil {
 			return false
@@ -62,6 +108,7 @@ func (p *globalPendingPool) Acquire(ctx context.Context, count int) bool {
 	}
 
 	p.current += count
+	p.currentBytes += bytes
 	return true
 }
 
@@ -116,7 +163,7 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Durat
 		}
 	}()
 
-	for p.current >= p.max {
+	for p.isFull() {
 		// Check if context is cancelled before waiting
 		if ctx.Err() != nil {
 			return WaitForSpaceCancelled
@@ -141,12 +188,16 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Durat
 	return WaitForSpaceOK
 }
 
-// Release returns count records worth of space back to the pool.
-func (p *globalPendingPool) Release(count int) {
+// Release returns count records and bytes worth of space back to the pool.
+func (p *globalPendingPool) Release(count, bytes int) {
 	p.mu.Lock()
 	p.current -= count
 	if p.current < 0 {
 		p.current = 0
+	}
+	p.currentBytes -= bytes
+	if p.currentBytes < 0 {
+		p.currentBytes = 0
 	}
 	p.cond.Broadcast()
 	p.mu.Unlock()
@@ -157,4 +208,11 @@ func (p *globalPendingPool) Current() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.current
+}
+
+// CurrentBytes returns the current byte count in the pool (for monitoring/debugging).
+func (p *globalPendingPool) CurrentBytes() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.currentBytes
 }

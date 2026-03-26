@@ -75,6 +75,10 @@ input:
       consumer_arn: ""
       record_buffer_cap: 0
       max_pending_records: 50000
+      max_active_subscriptions: 0
+      subscription_rotation_period: 0s
+      max_pending_bytes: 0
+      shard_startup_delay: 0s
     region: ""
     endpoint: ""
     credentials:
@@ -275,6 +279,38 @@ Maximum total number of records to buffer across all shards before applying back
 
 Type: `int`  
 Default: `50000`  
+
+### `enhanced_fan_out.max_active_subscriptions`
+
+Maximum number of shards that can have active EFO subscriptions simultaneously. Limits inbound data rate to N × 2MB/sec. Remaining claimed shards wait for a slot before subscribing. Set to 0 for unlimited (all shards subscribe immediately). Recommended for high shard counts to prevent OOM on startup and during runtime.
+
+
+Type: `int`  
+Default: `0`  
+
+### `enhanced_fan_out.subscription_rotation_period`
+
+Maximum duration a shard holds an active subscription before yielding its slot for another waiting shard. This ensures all shards receive data even when max_active_subscriptions is less than the total shard count. Rotation only occurs when at least one shard is waiting for a subscription slot. Set to 0 for no rotation (subscriptions run until AWS's 5-minute limit).
+
+
+Type: `string`  
+Default: `"0s"`  
+
+### `enhanced_fan_out.max_pending_bytes`
+
+Maximum total bytes to buffer across all shards before applying backpressure to Kinesis subscriptions. When both max_pending_records and max_pending_bytes are set, both limits apply and whichever is reached first triggers backpressure. This provides a true memory bound since Kinesis records can be up to 1 MB each. Set to 0 to disable byte-level accounting and rely solely on max_pending_records.
+
+
+Type: `int`  
+Default: `0`  
+
+### `enhanced_fan_out.shard_startup_delay`
+
+Delay between launching EFO shard consumers during startup. Prevents a thundering herd when many shards are claimed simultaneously, which can cause OOM on restart when all shards have a backlog. The first shard starts immediately; this delay is applied between subsequent launches. Set to 0 for no delay (all shards start immediately).
+
+
+Type: `string`  
+Default: `"0s"`  
 
 ### `region`
 
