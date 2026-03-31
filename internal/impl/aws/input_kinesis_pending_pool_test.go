@@ -384,3 +384,64 @@ func TestGlobalPendingPool_ByteLimit_ReleaseBelowZero(t *testing.T) {
 	assert.Equal(t, 0, pool.Current())
 	assert.Equal(t, 0, pool.CurrentBytes())
 }
+
+// TestGlobalPendingPool_CanNeverFit_RecordCount verifies that Acquire returns
+// false immediately when the request exceeds the record limit, even with a
+// non-cancelled context. This is the "canNeverFit" path that callers must
+// distinguish from context cancellation.
+func TestGlobalPendingPool_CanNeverFit_RecordCount(t *testing.T) {
+	pool := newGlobalPendingPool(100, 0)
+
+	ctx := context.Background()
+	result := pool.Acquire(ctx, 150, 0)
+
+	assert.False(t, result, "should reject batch exceeding record limit")
+	assert.NoError(t, ctx.Err(), "context must NOT be cancelled — caller must check ctx.Err() to distinguish")
+	assert.Equal(t, 0, pool.Current(), "pool must not be modified on rejection")
+}
+
+// TestGlobalPendingPool_CanNeverFit_ByteCount verifies the same for the byte limit.
+func TestGlobalPendingPool_CanNeverFit_ByteCount(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 500)
+
+	ctx := context.Background()
+	result := pool.Acquire(ctx, 1, 600)
+
+	assert.False(t, result, "should reject batch exceeding byte limit")
+	assert.NoError(t, ctx.Err(), "context must NOT be cancelled")
+	assert.Equal(t, 0, pool.Current(), "pool must not be modified on rejection")
+	assert.Equal(t, 0, pool.CurrentBytes(), "pool bytes must not be modified on rejection")
+}
+
+// TestGlobalPendingPool_CanNeverFit_ReturnsImmediately verifies that canNeverFit
+// does not block — it must return within milliseconds even if the pool is full.
+func TestGlobalPendingPool_CanNeverFit_ReturnsImmediately(t *testing.T) {
+	pool := newGlobalPendingPool(100, 500)
+
+	// Fill the pool completely
+	require.True(t, pool.Acquire(context.Background(), 100, 500))
+
+	// Oversized request should return immediately, not block
+	start := time.Now()
+	result := pool.Acquire(context.Background(), 200, 1000)
+	elapsed := time.Since(start)
+
+	assert.False(t, result)
+	assert.Less(t, elapsed, 10*time.Millisecond,
+		"canNeverFit must return immediately, not block waiting for space")
+}
+
+// TestGlobalPendingPool_MaxAccessors verifies the Max/MaxBytes getters.
+func TestGlobalPendingPool_MaxAccessors(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 5*1024*1024)
+
+	assert.Equal(t, 1000, pool.Max())
+	assert.Equal(t, 5*1024*1024, pool.MaxBytes())
+}
+
+func TestGlobalPendingPool_MaxAccessors_BytesDisabled(t *testing.T) {
+	pool := newGlobalPendingPool(500, 0)
+
+	assert.Equal(t, 500, pool.Max())
+	assert.Equal(t, 0, pool.MaxBytes())
+}

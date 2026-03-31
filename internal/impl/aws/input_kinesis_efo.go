@@ -659,11 +659,26 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 
 				// Acquire the actual space for this batch
 				if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records), totalBytes) {
-					// Context cancelled, return with current sequence
+					if ctx.Err() != nil {
+						// Context cancelled
+						if continuationSeq == "" {
+							continuationSeq = lastReceivedSeq
+						}
+						return continuationSeq, false, ctx.Err()
+					}
+					// Batch exceeds pool maximum (canNeverFit). This means
+					// max_pending_records or max_pending_bytes is smaller than a
+					// single EFO event batch. Log a warning and close the
+					// subscription so backoff prevents a tight retry loop.
+					k.log.Warnf("EFO batch for shard %v exceeds pool limits (%d records, %d bytes) — "+
+						"increase max_pending_records (currently %d) or max_pending_bytes (currently %d)",
+						shardID, len(shardEvent.Records), totalBytes,
+						k.globalPendingPool.Max(), k.globalPendingPool.MaxBytes())
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
 					}
-					return continuationSeq, false, ctx.Err()
+					return continuationSeq, false, fmt.Errorf(
+						"EFO batch too large for pool: %d records (%d bytes)", len(shardEvent.Records), totalBytes)
 				}
 
 				// Track the last record's sequence number for fallback

@@ -216,3 +216,13 @@ func (p *globalPendingPool) CurrentBytes() int {
 	defer p.mu.Unlock()
 	return p.currentBytes
 }
+
+// Max returns the maximum record count for the pool.
+func (p *globalPendingPool) Max() int {
+	return p.max
+}
+
+// MaxBytes returns the maximum byte limit for the pool (0 means disabled).
+func (p *globalPendingPool) MaxBytes() int {
+	return p.maxBytes
+}
