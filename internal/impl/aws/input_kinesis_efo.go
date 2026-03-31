@@ -198,6 +198,12 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 	var pending []types.Record
 	var pendingBytes int
 
+	// Track records moved into the batcher but not yet flushed to msgChan.
+	// Pool space is held until the batched message is sent downstream, so
+	// backpressure accounts for batcher + pending memory, not just pending.
+	var batcherCount int
+	var batcherBytes int
+
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
 	subscriptionTrigger <- startingSequence     // Start with initial sequence
@@ -213,9 +219,9 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			commitCtxClose()
 			recordBatcher.Close(context.Background(), state == awsKinesisConsumerFinished)
 
-			// Release any remaining pending records back to the global pool
-			if len(pending) > 0 {
-				k.globalPendingPool.Release(len(pending), pendingBytes)
+			// Release any remaining pending records and batcher records back to the global pool
+			if len(pending) > 0 || batcherCount > 0 {
+				k.globalPendingPool.Release(len(pending)+batcherCount, pendingBytes+batcherBytes)
 			}
 
 			reason := ""
@@ -391,13 +397,17 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 							break
 						}
 					}
-					// Release processed records back to the global pool
+					// Transfer processed records from pending tracking to batcher tracking.
+					// Pool space is NOT released here — it stays held until the batched
+					// message is flushed to msgChan, so backpressure accounts for all
+					// in-memory data (pending + batcher + in-flight messages).
 					processedCount := i + 1
 					processedBytes := 0
 					for _, r := range pending[:processedCount] {
 						processedBytes += len(r.Data)
 					}
-					k.globalPendingPool.Release(processedCount, processedBytes)
+					batcherCount += processedCount
+					batcherBytes += processedBytes
 					pendingBytes -= processedBytes
 					pending = pending[processedCount:]
 				}
@@ -451,6 +461,13 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 
 			case nextFlushChan <- pendingMsg:
 				pendingMsg = asyncMessage{}
+				// Release pool space now that the message has been handed downstream.
+				// This is the point where data leaves our local buffers.
+				if batcherCount > 0 {
+					k.globalPendingPool.Release(batcherCount, batcherBytes)
+					batcherCount = 0
+					batcherBytes = 0
+				}
 
 			case records := <-nextRecordsChan:
 				// Received records from subscription
