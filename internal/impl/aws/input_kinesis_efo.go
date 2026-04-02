@@ -606,6 +606,31 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 			// Space available, continue
 		}
 
+		// Acquire a read permit before fetching data from the stream. This limits how
+		// many shards can concurrently hold an in-flight batch (read from stream but
+		// not yet handed off to the pending pool), preventing a thundering-herd OOM
+		// when many shards wake simultaneously after backpressure lifts.
+		permitAcquired := false
+		if k.readPermitSem != nil {
+			select {
+			case <-k.readPermitSem:
+				permitAcquired = true
+			case <-ctx.Done():
+				if continuationSeq == "" {
+					continuationSeq = lastReceivedSeq
+				}
+				return continuationSeq, false, ctx.Err()
+			}
+		}
+		// releasePermit returns the permit to the semaphore. It is idempotent —
+		// safe to call multiple times within a single loop iteration.
+		releasePermit := func() {
+			if permitAcquired {
+				permitAcquired = false
+				k.readPermitSem <- struct{}{}
+			}
+		}
+
 		// Check rotation timer — only yield if another shard is actually waiting for a slot
 		select {
 		case <-rotationTimer:
@@ -614,6 +639,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 				if continuationSeq == "" {
 					continuationSeq = lastReceivedSeq
 				}
+				releasePermit()
 				return continuationSeq, false, nil
 			}
 			// No shards waiting — reset timer and keep going
@@ -624,6 +650,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 		// Now fetch the next event
 		event, ok := <-eventsChan
 		if !ok {
+			releasePermit()
 			break
 		}
 
@@ -646,6 +673,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
 					}
+					releasePermit()
 					return continuationSeq, false, ctx.Err()
 				}
 
@@ -656,6 +684,8 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 				}
 				select {
 				case recordsChan <- shardEvent.Records:
+					// Batch handed off — permit can be released so another shard can read
+					releasePermit()
 				case <-ctx.Done():
 					// Release the acquired space since we couldn't send
 					k.globalPendingPool.Release(len(shardEvent.Records), totalBytes)
@@ -663,6 +693,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
 					}
+					releasePermit()
 					return continuationSeq, false, ctx.Err()
 				}
 			}
@@ -685,6 +716,10 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 		default:
 			k.log.Warnf("Unknown event type received: %T", event)
 		}
+
+		// Release permit at end of iteration — covers empty-batch and unknown-event
+		// paths where no explicit release occurs above. Idempotent if already released.
+		releasePermit()
 	}
 
 	// Use lastReceivedSeq as fallback if continuationSeq not set

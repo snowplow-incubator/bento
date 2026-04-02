@@ -50,6 +50,7 @@ const (
 	kiEFOFieldSubscriptionRotationPeriod = "subscription_rotation_period"
 	kiEFOFieldMaxPendingBytes            = "max_pending_bytes"
 	kiEFOFieldShardStartupDelay          = "shard_startup_delay"
+	kiEFOFieldMaxConcurrentReads         = "max_concurrent_reads"
 )
 
 type kiEFOConfig struct {
@@ -62,6 +63,7 @@ type kiEFOConfig struct {
 	SubscriptionRotationPeriod time.Duration
 	MaxPendingBytes            int
 	ShardStartupDelay          time.Duration
+	MaxConcurrentReads         int
 }
 
 type kiConfig struct {
@@ -143,6 +145,13 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 			return
 		}
 		if efoConf.ShardStartupDelay, err = efoNs.FieldDuration(kiEFOFieldShardStartupDelay); err != nil {
+			return
+		}
+		if efoConf.MaxConcurrentReads, err = efoNs.FieldInt(kiEFOFieldMaxConcurrentReads); err != nil {
+			return
+		}
+		if efoConf.MaxConcurrentReads < 0 {
+			err = errors.New("enhanced_fan_out.max_concurrent_reads must be at least 0")
 			return
 		}
 		conf.EnhancedFanOut = efoConf
@@ -250,6 +259,10 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 				Description("Delay between launching EFO shard consumers during startup. Prevents a thundering herd when many shards are claimed simultaneously, which can cause OOM on restart when all shards have a backlog. The first shard starts immediately; this delay is applied between subsequent launches. Set to 0 for no delay (all shards start immediately).").
 				Default("0s").
 				Advanced(),
+			service.NewIntField(kiEFOFieldMaxConcurrentReads).
+				Description("Maximum number of shards that can concurrently read a batch from their Kinesis event stream and acquire space in the pending pool. When the pending pool drains and many shards are waiting, they all wake simultaneously — without this limit each shard reads its next batch before pool space is confirmed, causing a memory spike proportional to shard count × batch size. Setting this to a small value (e.g. 8) staggers reads in a round-robin fashion so at most N batches are in flight at once. Set to 0 for unlimited (preserves original behaviour).").
+				Default(0).
+				Advanced(),
 		).
 			Description("Enhanced Fan Out configuration for push-based streaming. Provides dedicated 2 MB/sec throughput per consumer per shard and lower latency (~70ms). Note: EFO incurs per shard-hour charges.").
 			Version("1.16.0").
@@ -311,6 +324,7 @@ type kinesisReader struct {
 	globalPendingPool   *globalPendingPool
 	subscriptionSem     chan struct{}
 	subscriptionWaiters atomic.Int32
+	readPermitSem       chan struct{}
 
 	streams []*streamInfo
 
@@ -454,6 +468,13 @@ func newKinesisReaderFromConfig(conf kiConfig, batcher service.BatchPolicy, sess
 				k.subscriptionSem <- struct{}{}
 			}
 			k.log.Debugf("EFO subscription semaphore configured with %d slots", n)
+		}
+		if n := k.conf.EnhancedFanOut.MaxConcurrentReads; n > 0 {
+			k.readPermitSem = make(chan struct{}, n)
+			for range n {
+				k.readPermitSem <- struct{}{}
+			}
+			k.log.Debugf("EFO read permit semaphore configured with %d slots", n)
 		}
 	}
 
