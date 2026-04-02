@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/kinesis/types"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gofrs/uuid"
+	"golang.org/x/time/rate"
 
 	"github.com/warpstreamlabs/bento/internal/impl/aws/config"
 	"github.com/warpstreamlabs/bento/internal/impl/aws/helper"
@@ -51,6 +52,7 @@ const (
 	kiEFOFieldMaxPendingBytes            = "max_pending_bytes"
 	kiEFOFieldShardStartupDelay          = "shard_startup_delay"
 	kiEFOFieldMaxConcurrentReads         = "max_concurrent_reads"
+	kiEFOFieldMaxIngestionBytesPerSec    = "max_ingestion_bytes_per_sec"
 )
 
 type kiEFOConfig struct {
@@ -64,6 +66,7 @@ type kiEFOConfig struct {
 	MaxPendingBytes            int
 	ShardStartupDelay          time.Duration
 	MaxConcurrentReads         int
+	MaxIngestionBytesPerSec    int
 }
 
 type kiConfig struct {
@@ -152,6 +155,13 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 		}
 		if efoConf.MaxConcurrentReads < 0 {
 			err = errors.New("enhanced_fan_out.max_concurrent_reads must be at least 0")
+			return
+		}
+		if efoConf.MaxIngestionBytesPerSec, err = efoNs.FieldInt(kiEFOFieldMaxIngestionBytesPerSec); err != nil {
+			return
+		}
+		if efoConf.MaxIngestionBytesPerSec < 0 {
+			err = errors.New("enhanced_fan_out.max_ingestion_bytes_per_sec must be at least 0")
 			return
 		}
 		conf.EnhancedFanOut = efoConf
@@ -260,7 +270,11 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 				Default("0s").
 				Advanced(),
 			service.NewIntField(kiEFOFieldMaxConcurrentReads).
-				Description("Maximum number of shards that can concurrently read a batch from their Kinesis event stream and acquire space in the pending pool. When the pending pool drains and many shards are waiting, they all wake simultaneously — without this limit each shard reads its next batch before pool space is confirmed, causing a memory spike proportional to shard count × batch size. Setting this to a small value (e.g. 8) staggers reads in a round-robin fashion so at most N batches are in flight at once. Set to 0 for unlimited (preserves original behaviour).").
+				Description("Maximum number of shards that can concurrently send data into the pending pool. All shards remain subscribed via EFO at all times; this limit only controls how many can read the next event and acquire pool space simultaneously. Without this limit, when backpressure lifts all shards wake at once and read large batches simultaneously, spiking memory. Setting this to a small value (e.g. 8) staggers reads so at most N batches are in flight at any time. Set to 0 for unlimited (preserves original behaviour).").
+				Default(0).
+				Advanced(),
+			service.NewIntField(kiEFOFieldMaxIngestionBytesPerSec).
+				Description("Maximum total bytes per second to accept across all shards. When set, each batch of records must wait for a token-bucket allowance before being admitted into the pending pool, providing a hard rate cap regardless of shard count. A single EFO event can be up to 10 MB, so the effective burst is max(10 MB, this value) to ensure any valid event can always be admitted. Set to 0 to disable rate limiting.").
 				Default(0).
 				Advanced(),
 		).
@@ -325,6 +339,7 @@ type kinesisReader struct {
 	subscriptionSem     chan struct{}
 	subscriptionWaiters atomic.Int32
 	readPermitSem       chan struct{}
+	ingestLimiter       *rate.Limiter
 
 	streams []*streamInfo
 
@@ -475,6 +490,17 @@ func newKinesisReaderFromConfig(conf kiConfig, batcher service.BatchPolicy, sess
 				k.readPermitSem <- struct{}{}
 			}
 			k.log.Debugf("EFO read permit semaphore configured with %d slots", n)
+		}
+		if n := k.conf.EnhancedFanOut.MaxIngestionBytesPerSec; n > 0 {
+			// Burst must be >= the largest possible single EFO event (10 MB) so
+			// WaitN never returns an error for a valid batch.
+			const maxEFOEventBytes = 10 * 1024 * 1024
+			burst := n
+			if burst < maxEFOEventBytes {
+				burst = maxEFOEventBytes
+			}
+			k.ingestLimiter = rate.NewLimiter(rate.Limit(n), burst)
+			k.log.Debugf("EFO ingestion rate limiter configured: %d bytes/sec", n)
 		}
 	}
 
