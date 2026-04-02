@@ -485,6 +485,305 @@ func TestEFOLoadSimulation_LargeRecords_EarlyVsDeferred(t *testing.T) {
 	})
 }
 
+// TestEFOLoadSimulation_WithReservation simulates the full reservation lifecycle:
+// Acquire reservation → subscribe → read event → ConvertReservation → send records →
+// re-acquire reservation for next event. Compares with the deferred-release
+// baseline (no reservation) to show how reservations limit concurrent readers
+// and bound memory.
+func TestEFOLoadSimulation_WithReservation(t *testing.T) {
+	const (
+		numShards             = 60
+		maxPendingRecords     = 50000
+		maxPendingBytes       = 200 * 1024 * 1024 // 200 MB
+		initialReservation    = 50 * 1024 * 1024   // 50 MB → ~4 concurrent shards
+		recordsPerBatch       = 50
+		recordSizeBytes       = 10 * 1024 // 10 KB per record → 500 KB per batch
+		batchSize             = 200
+		testDuration          = 10 * time.Second
+		outputLatency         = 20 * time.Millisecond
+		subscriptionDelay     = 2 * time.Millisecond
+	)
+
+	pool := newGlobalPendingPool(maxPendingRecords, maxPendingBytes)
+	avg := newEventSizeAverage(0.1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration+5*time.Second)
+	defer cancel()
+
+	var (
+		totalProduced, totalConsumed       atomic.Int64
+		totalBytesProduced, totalBytesConsumed atomic.Int64
+		backpressureEvents                 atomic.Int64
+		peakPoolBytes, peakPoolRecords     atomic.Int64
+		peakAlloc                          atomic.Int64
+		peakConcurrentReaders              atomic.Int32
+		currentReaders                     atomic.Int32
+	)
+
+	// Peak trackers
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				curB := int64(pool.CurrentBytes())
+				curR := int64(pool.Current())
+				for {
+					old := peakPoolBytes.Load()
+					if curB <= old || peakPoolBytes.CompareAndSwap(old, curB) {
+						break
+					}
+				}
+				for {
+					old := peakPoolRecords.Load()
+					if curR <= old || peakPoolRecords.CompareAndSwap(old, curR) {
+						break
+					}
+				}
+			}
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+				alloc := int64(m.Alloc)
+				for {
+					old := peakAlloc.Load()
+					if alloc <= old || peakAlloc.CompareAndSwap(old, alloc) {
+						break
+					}
+				}
+			}
+		}
+	}()
+
+	type flushedBatch struct {
+		count int
+		bytes int
+		data  [][]byte
+	}
+	msgChan := make(chan flushedBatch, 100)
+
+	var outputWg sync.WaitGroup
+	outputWg.Add(1)
+	go func() {
+		defer outputWg.Done()
+		for batch := range msgChan {
+			totalConsumed.Add(int64(batch.count))
+			totalBytesConsumed.Add(int64(batch.bytes))
+			_ = batch.data
+			time.Sleep(outputLatency)
+		}
+	}()
+
+	testCtx, testCancel := context.WithTimeout(ctx, testDuration)
+	defer testCancel()
+
+	type recordBatch struct {
+		count int
+		bytes int
+		data  [][]byte
+	}
+
+	var shardWg sync.WaitGroup
+	for shard := range numShards {
+		recordsChan := make(chan recordBatch, 1)
+
+		// --- Subscription goroutine (simulates efoSubscribeAndStream with reservation) ---
+		shardWg.Add(1)
+		go func(shardID int) {
+			defer shardWg.Done()
+			defer close(recordsChan)
+
+			for {
+				select {
+				case <-testCtx.Done():
+					return
+				default:
+				}
+
+				// Determine reservation size (adaptive)
+				reservation := initialReservation
+				if a := avg.Get(); a > 0 {
+					reservation = a
+				}
+
+				// Acquire reservation before "subscribing"
+				if !pool.Acquire(testCtx, 0, reservation) {
+					return // context cancelled
+				}
+
+				// Track concurrent readers
+				cur := currentReaders.Add(1)
+				for {
+					old := peakConcurrentReaders.Load()
+					if cur <= old || peakConcurrentReaders.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+
+				// Simulate reading events from one subscription (up to 5 events per sub)
+				for event := range 5 {
+					_ = event
+					select {
+					case <-testCtx.Done():
+						currentReaders.Add(-1)
+						if reservation > 0 {
+							pool.Release(0, reservation)
+						}
+						return
+					case <-time.After(subscriptionDelay):
+					}
+
+					batchBytes := recordsPerBatch * recordSizeBytes
+
+					// Update global average
+					avg.Update(batchBytes)
+
+					// ConvertReservation: swap reservation for actual bytes
+					if reservation > 0 {
+						pool.ConvertReservation(recordsPerBatch, batchBytes, reservation)
+						reservation = 0
+					} else {
+						// No reservation for subsequent events — acquire normally
+						if !pool.Acquire(testCtx, recordsPerBatch, batchBytes) {
+							currentReaders.Add(-1)
+							return
+						}
+					}
+					totalProduced.Add(int64(recordsPerBatch))
+					totalBytesProduced.Add(int64(batchBytes))
+
+					// Create heap-live payloads
+					data := make([][]byte, recordsPerBatch)
+					for i := range data {
+						data[i] = make([]byte, recordSizeBytes)
+					}
+
+					select {
+					case recordsChan <- recordBatch{count: recordsPerBatch, bytes: batchBytes, data: data}:
+					case <-testCtx.Done():
+						pool.Release(recordsPerBatch, batchBytes)
+						currentReaders.Add(-1)
+						return
+					}
+
+					// Re-acquire reservation for next event
+					nextReservation := initialReservation
+					if a := avg.Get(); a > 0 {
+						nextReservation = a
+					}
+					if !pool.Acquire(testCtx, 0, nextReservation) {
+						currentReaders.Add(-1)
+						return
+					}
+					reservation = nextReservation
+				}
+
+				// Subscription ends — release reservation
+				currentReaders.Add(-1)
+				if reservation > 0 {
+					pool.Release(0, reservation)
+				}
+			}
+		}(shard)
+
+		// --- Consumer goroutine ---
+		shardWg.Add(1)
+		go func(shardID int) {
+			defer shardWg.Done()
+			var batcherCount, batcherBytes int
+			var batcherData [][]byte
+
+			cleanup := func() {
+				if batcherCount > 0 {
+					pool.Release(batcherCount, batcherBytes)
+					batcherCount = 0
+					batcherBytes = 0
+				}
+			}
+
+			for batch := range recordsChan {
+				batcherCount += batch.count
+				batcherBytes += batch.bytes
+				batcherData = append(batcherData, batch.data...)
+
+				if batcherCount >= batchSize {
+					select {
+					case msgChan <- flushedBatch{count: batcherCount, bytes: batcherBytes, data: batcherData}:
+						pool.Release(batcherCount, batcherBytes)
+						batcherCount = 0
+						batcherBytes = 0
+						batcherData = nil
+					case <-testCtx.Done():
+						cleanup()
+						// Drain remaining records from channel
+						for leftover := range recordsChan {
+							pool.Release(leftover.count, leftover.bytes)
+						}
+						return
+					}
+				}
+			}
+			// Flush remaining
+			if batcherCount > 0 {
+				select {
+				case msgChan <- flushedBatch{count: batcherCount, bytes: batcherBytes, data: batcherData}:
+					pool.Release(batcherCount, batcherBytes)
+				default:
+					pool.Release(batcherCount, batcherBytes)
+				}
+			}
+		}(shard)
+	}
+
+	<-testCtx.Done()
+	shardWg.Wait()
+	close(msgChan)
+	outputWg.Wait()
+
+	var finalMem runtime.MemStats
+	runtime.ReadMemStats(&finalMem)
+
+	t.Logf("=== RESERVATION-BASED BACKPRESSURE (%d shards, %s) ===", numShards, testDuration)
+	t.Logf("Pool config: max_pending_bytes=%d MB, initial_reservation=%d MB",
+		maxPendingBytes/(1024*1024), initialReservation/(1024*1024))
+	t.Logf("Record config: %d records/batch × %d KB = %d KB/batch",
+		recordsPerBatch, recordSizeBytes/1024, recordsPerBatch*recordSizeBytes/1024)
+	t.Logf("")
+	t.Logf("Records produced:       %d", totalProduced.Load())
+	t.Logf("Records consumed:       %d", totalConsumed.Load())
+	t.Logf("Bytes produced:         %d MB", totalBytesProduced.Load()/(1024*1024))
+	t.Logf("Bytes consumed:         %d MB", totalBytesConsumed.Load()/(1024*1024))
+	t.Logf("")
+	t.Logf("Peak pool bytes:        %d MB / %d MB", peakPoolBytes.Load()/(1024*1024), maxPendingBytes/(1024*1024))
+	t.Logf("Peak pool records:      %d / %d", peakPoolRecords.Load(), maxPendingRecords)
+	t.Logf("Backpressure events:    %d", backpressureEvents.Load())
+	t.Logf("Peak concurrent readers: %d (expected ~%d)", peakConcurrentReaders.Load(), maxPendingBytes/initialReservation)
+	t.Logf("Final avg event size:   %d KB (from %d observations)", avg.Get()/1024, avg.Count())
+	t.Logf("")
+	t.Logf("Peak heap alloc:        %d MB", peakAlloc.Load()/(1024*1024))
+	t.Logf("Final heap alloc:       %d MB", finalMem.Alloc/(1024*1024))
+	t.Logf("Total heap alloc:       %d MB", finalMem.TotalAlloc/(1024*1024))
+	t.Logf("Num GC cycles:          %d", finalMem.NumGC)
+
+	require.LessOrEqual(t, peakPoolBytes.Load(), int64(maxPendingBytes),
+		"pool bytes exceeded maximum")
+	require.Equal(t, 0, pool.Current(), "pool should be empty after test")
+	require.Equal(t, 0, pool.CurrentBytes(), "pool bytes should be zero after test")
+}
+
 // makeTestRecords creates a batch of Kinesis records with the given size for testing.
 func makeTestRecords(count, sizeBytes int, seqStart int) []types.Record {
 	payload := make([]byte, sizeBytes)

@@ -553,20 +553,43 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 		}
 	}
 
-	// Acquire subscription slot if semaphore is configured
-	if k.subscriptionSem != nil {
-		k.subscriptionWaiters.Add(1)
-		select {
-		case <-k.subscriptionSem:
-			k.subscriptionWaiters.Add(-1)
-			defer func() { k.subscriptionSem <- struct{}{} }()
-		case <-ctx.Done():
-			k.subscriptionWaiters.Add(-1)
-			return "", false, ctx.Err()
+	// Determine initial reservation size: use rolling average if available,
+	// otherwise fall back to the configured initial value.
+	reservationCfg := 0
+	if k.conf.EnhancedFanOut != nil {
+		reservationCfg = k.conf.EnhancedFanOut.ShardReadReservationBytes
+	}
+	reservationBytes := reservationCfg
+	if k.eventSizeAvg != nil {
+		if avg := k.eventSizeAvg.Get(); avg > 0 {
+			reservationBytes = avg
 		}
 	}
 
-	k.log.Debugf("Subscribing to shard %v with sequence %v", shardID, startingSequence)
+	// Acquire byte reservation before subscribing — limits how many shards
+	// can have active subscriptions concurrently.
+	if reservationBytes > 0 {
+		if !k.globalPendingPool.Acquire(ctx, 0, reservationBytes) {
+			if ctx.Err() != nil {
+				return "", false, ctx.Err()
+			}
+			// Reservation exceeds pool max (canNeverFit). Fall back to no reservation.
+			k.log.Warnf("Shard %v: reservation %d bytes exceeds pool max %d bytes, subscribing without reservation",
+				shardID, reservationBytes, k.globalPendingPool.MaxBytes())
+			reservationBytes = 0
+		}
+	}
+
+	// releaseReservation refunds any held reservation bytes back to the pool.
+	// Must be called on every exit path from this function.
+	releaseReservation := func() {
+		if reservationBytes > 0 {
+			k.globalPendingPool.Release(0, reservationBytes)
+			reservationBytes = 0
+		}
+	}
+
+	k.log.Debugf("Subscribing to shard %v with sequence %v (reservation: %d bytes)", shardID, startingSequence, reservationBytes)
 
 	input := &kinesis.SubscribeToShardInput{
 		ConsumerARN:      aws.String(info.efoManager.consumerARN),
@@ -576,6 +599,7 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 
 	output, err := k.svc.SubscribeToShard(ctx, input)
 	if err != nil {
+		releaseReservation()
 		return "", false, fmt.Errorf("failed to subscribe to shard: %w", err)
 	}
 
@@ -588,54 +612,29 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 	shardFinished := false
 	eventsChan := eventStream.Events()
 
-	// Set up rotation timer if configured — yields the subscription slot for waiting
-	// shards, but only when at least one shard is actually blocked on the semaphore.
-	var rotationTimer <-chan time.Time
-	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.SubscriptionRotationPeriod > 0 {
-		rotationTimer = time.After(k.conf.EnhancedFanOut.SubscriptionRotationPeriod)
-	}
-
 	// Timeout for waiting on backpressure - if we wait too long, close the subscription
 	// cleanly and resubscribe rather than letting AWS forcibly terminate the connection.
 	// 30 seconds is well under the 5-minute EFO subscription timeout.
 	const backpressureTimeout = 30 * time.Second
 
 	for {
-		// Wait for space in the global pool before fetching the next event
-		// This applies backpressure to Kinesis before data enters memory
-		switch k.globalPendingPool.WaitForSpace(ctx, backpressureTimeout) {
-		case WaitForSpaceCancelled:
-			// Context cancelled
-			if continuationSeq == "" {
-				continuationSeq = lastReceivedSeq
-			}
-			return continuationSeq, false, ctx.Err()
-		case WaitForSpaceTimeout:
-			// Backpressure timeout - close subscription cleanly and return error to trigger backoff
-			// This prevents AWS from forcibly terminating the connection after extended inactivity
-			// and ensures we don't immediately resubscribe while backpressure persists
-			k.log.Debugf("Backpressure timeout for shard %v, closing subscription to resubscribe with backoff", shardID)
-			if continuationSeq == "" {
-				continuationSeq = lastReceivedSeq
-			}
-			return continuationSeq, false, errBackpressureTimeout
-		case WaitForSpaceOK:
-			// Space available, continue
-		}
-
-		// Check rotation timer — only yield if another shard is actually waiting for a slot
-		select {
-		case <-rotationTimer:
-			if k.subscriptionWaiters.Load() > 0 {
-				k.log.Debugf("Subscription rotation for shard %v, yielding slot for waiting shard", shardID)
+		// If no reservation held, apply backpressure via WaitForSpace (original behaviour).
+		// When reservations are enabled, the reservation itself provides backpressure.
+		if reservationBytes == 0 && reservationCfg == 0 {
+			switch k.globalPendingPool.WaitForSpace(ctx, backpressureTimeout) {
+			case WaitForSpaceCancelled:
 				if continuationSeq == "" {
 					continuationSeq = lastReceivedSeq
 				}
-				return continuationSeq, false, nil
+				return continuationSeq, false, ctx.Err()
+			case WaitForSpaceTimeout:
+				k.log.Debugf("Backpressure timeout for shard %v, closing subscription to resubscribe with backoff", shardID)
+				if continuationSeq == "" {
+					continuationSeq = lastReceivedSeq
+				}
+				return continuationSeq, false, errBackpressureTimeout
+			case WaitForSpaceOK:
 			}
-			// No shards waiting — reset timer and keep going
-			rotationTimer = time.After(k.conf.EnhancedFanOut.SubscriptionRotationPeriod)
-		default:
 		}
 
 		// Now fetch the next event
@@ -657,28 +656,37 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 					totalBytes += len(r.Data)
 				}
 
-				// Acquire the actual space for this batch
-				if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records), totalBytes) {
-					if ctx.Err() != nil {
-						// Context cancelled
+				// Update the global event size average for adaptive reservations
+				if k.eventSizeAvg != nil {
+					k.eventSizeAvg.Update(totalBytes)
+				}
+
+				if reservationBytes > 0 {
+					// Convert reservation into actual record tracking (atomic, non-blocking).
+					// If actual < reservation: frees pool space.
+					// If actual > reservation: pool grows (next Acquire will enforce limits).
+					k.globalPendingPool.ConvertReservation(len(shardEvent.Records), totalBytes, reservationBytes)
+					reservationBytes = 0
+				} else {
+					// No reservation held — acquire normally
+					if !k.globalPendingPool.Acquire(ctx, len(shardEvent.Records), totalBytes) {
+						if ctx.Err() != nil {
+							if continuationSeq == "" {
+								continuationSeq = lastReceivedSeq
+							}
+							return continuationSeq, false, ctx.Err()
+						}
+						// Batch exceeds pool maximum (canNeverFit)
+						k.log.Warnf("EFO batch for shard %v exceeds pool limits (%d records, %d bytes) — "+
+							"increase max_pending_records (currently %d) or max_pending_bytes (currently %d)",
+							shardID, len(shardEvent.Records), totalBytes,
+							k.globalPendingPool.Max(), k.globalPendingPool.MaxBytes())
 						if continuationSeq == "" {
 							continuationSeq = lastReceivedSeq
 						}
-						return continuationSeq, false, ctx.Err()
+						return continuationSeq, false, fmt.Errorf(
+							"EFO batch too large for pool: %d records (%d bytes)", len(shardEvent.Records), totalBytes)
 					}
-					// Batch exceeds pool maximum (canNeverFit). This means
-					// max_pending_records or max_pending_bytes is smaller than a
-					// single EFO event batch. Log a warning and close the
-					// subscription so backoff prevents a tight retry loop.
-					k.log.Warnf("EFO batch for shard %v exceeds pool limits (%d records, %d bytes) — "+
-						"increase max_pending_records (currently %d) or max_pending_bytes (currently %d)",
-						shardID, len(shardEvent.Records), totalBytes,
-						k.globalPendingPool.Max(), k.globalPendingPool.MaxBytes())
-					if continuationSeq == "" {
-						continuationSeq = lastReceivedSeq
-					}
-					return continuationSeq, false, fmt.Errorf(
-						"EFO batch too large for pool: %d records (%d bytes)", len(shardEvent.Records), totalBytes)
 				}
 
 				// Track the last record's sequence number for fallback
@@ -691,7 +699,6 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 				case <-ctx.Done():
 					// Release the acquired space since we couldn't send
 					k.globalPendingPool.Release(len(shardEvent.Records), totalBytes)
-					// Use lastReceivedSeq as fallback if continuationSeq not set
 					if continuationSeq == "" {
 						continuationSeq = lastReceivedSeq
 					}
@@ -717,7 +724,36 @@ func (k *kinesisReader) efoSubscribeAndStream(ctx context.Context, info streamIn
 		default:
 			k.log.Warnf("Unknown event type received: %T", event)
 		}
+
+		// Re-acquire reservation for the next event read.
+		// Use the adaptive average if available, otherwise the configured initial value.
+		if reservationCfg > 0 && reservationBytes == 0 {
+			nextReservation := reservationCfg
+			if k.eventSizeAvg != nil {
+				if avg := k.eventSizeAvg.Get(); avg > 0 {
+					nextReservation = avg
+				}
+			}
+			if !k.globalPendingPool.Acquire(ctx, 0, nextReservation) {
+				if ctx.Err() != nil {
+					if continuationSeq == "" {
+						continuationSeq = lastReceivedSeq
+					}
+					return continuationSeq, false, ctx.Err()
+				}
+				// Reservation can't fit — close subscription for backoff
+				k.log.Debugf("Backpressure: shard %v cannot re-acquire reservation (%d bytes), closing subscription", shardID, nextReservation)
+				if continuationSeq == "" {
+					continuationSeq = lastReceivedSeq
+				}
+				return continuationSeq, false, errBackpressureTimeout
+			}
+			reservationBytes = nextReservation
+		}
 	}
+
+	// Release any held reservation on stream end
+	releaseReservation()
 
 	// Use lastReceivedSeq as fallback if continuationSeq not set
 	if continuationSeq == "" {

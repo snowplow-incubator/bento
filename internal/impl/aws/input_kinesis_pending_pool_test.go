@@ -3,6 +3,7 @@ package aws
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -444,4 +445,141 @@ func TestGlobalPendingPool_MaxAccessors_BytesDisabled(t *testing.T) {
 
 	assert.Equal(t, 500, pool.Max())
 	assert.Equal(t, 0, pool.MaxBytes())
+}
+
+// --- ConvertReservation tests ---
+
+func TestGlobalPendingPool_ConvertReservation_SmallerThanReserved(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 200*1024*1024) // 200 MB
+
+	// Reserve 50MB
+	require.True(t, pool.Acquire(context.Background(), 0, 50*1024*1024))
+	assert.Equal(t, 50*1024*1024, pool.CurrentBytes())
+	assert.Equal(t, 0, pool.Current())
+
+	// Event arrives with 200 records, 800KB (much less than 50MB reservation)
+	pool.ConvertReservation(200, 800*1024, 50*1024*1024)
+
+	// Records should be tracked
+	assert.Equal(t, 200, pool.Current())
+	// Bytes should be 800KB (reservation freed, actual charged)
+	assert.Equal(t, 800*1024, pool.CurrentBytes())
+}
+
+func TestGlobalPendingPool_ConvertReservation_LargerThanReserved(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 200*1024*1024) // 200 MB
+
+	// Reserve 1MB
+	require.True(t, pool.Acquire(context.Background(), 0, 1*1024*1024))
+
+	// Event arrives with 100 records, 5MB (larger than 1MB reservation)
+	pool.ConvertReservation(100, 5*1024*1024, 1*1024*1024)
+
+	assert.Equal(t, 100, pool.Current())
+	// Pool grows: was 1MB, now 1MB + (5MB - 1MB) = 5MB
+	assert.Equal(t, 5*1024*1024, pool.CurrentBytes())
+}
+
+func TestGlobalPendingPool_ConvertReservation_ExactMatch(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 200*1024*1024) // 200 MB
+
+	// Reserve 2MB
+	require.True(t, pool.Acquire(context.Background(), 0, 2*1024*1024))
+
+	// Event arrives with exactly 2MB
+	pool.ConvertReservation(50, 2*1024*1024, 2*1024*1024)
+
+	assert.Equal(t, 50, pool.Current())
+	assert.Equal(t, 2*1024*1024, pool.CurrentBytes()) // unchanged
+}
+
+func TestGlobalPendingPool_ConvertReservation_WakesWaiters(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 100) // 100 bytes max
+
+	// Fill the pool with a reservation
+	require.True(t, pool.Acquire(context.Background(), 0, 100))
+
+	// Start a goroutine waiting for space
+	acquired := make(chan bool, 1)
+	go func() {
+		acquired <- pool.Acquire(context.Background(), 0, 50)
+	}()
+
+	// Give the goroutine time to start waiting
+	time.Sleep(50 * time.Millisecond)
+
+	// Convert reservation: actual is only 10 bytes, freeing 90 bytes
+	pool.ConvertReservation(5, 10, 100)
+
+	// The waiting goroutine should now be able to acquire
+	select {
+	case result := <-acquired:
+		assert.True(t, result)
+	case <-time.After(time.Second):
+		t.Fatal("ConvertReservation should have woken the waiting goroutine")
+	}
+}
+
+func TestGlobalPendingPool_ConvertReservation_ClampsToZero(t *testing.T) {
+	pool := newGlobalPendingPool(1000, 200*1024*1024)
+
+	// Reserve 50MB, but somehow current bytes are already low
+	// (e.g. from concurrent releases)
+	require.True(t, pool.Acquire(context.Background(), 0, 10))
+
+	// Convert with actual < reservation — would make currentBytes negative
+	pool.ConvertReservation(1, 5, 10)
+
+	assert.Equal(t, 1, pool.Current())
+	assert.Equal(t, 5, pool.CurrentBytes()) // should not go negative
+}
+
+func TestGlobalPendingPool_ReservationLimitsConcurrency(t *testing.T) {
+	// 200MB pool, 50MB reservation = at most 4 concurrent reservations
+	pool := newGlobalPendingPool(100000, 200*1024*1024)
+	reservationSize := 50 * 1024 * 1024
+
+	var activeReservations atomic.Int32
+	var peakReservations atomic.Int32
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	for range 20 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				if !pool.Acquire(ctx, 0, reservationSize) {
+					return
+				}
+
+				cur := activeReservations.Add(1)
+				// Track peak
+				for {
+					old := peakReservations.Load()
+					if cur <= old || peakReservations.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+
+				// Simulate event processing
+				time.Sleep(5 * time.Millisecond)
+
+				activeReservations.Add(-1)
+				pool.Release(0, reservationSize)
+			}
+		})
+	}
+
+	<-ctx.Done()
+	wg.Wait()
+
+	assert.LessOrEqual(t, peakReservations.Load(), int32(4),
+		"should never have more than 4 concurrent reservations (200MB / 50MB)")
 }

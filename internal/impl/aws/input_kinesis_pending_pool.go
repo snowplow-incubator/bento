@@ -6,10 +6,9 @@ import (
 	"time"
 )
 
-// globalPendingPool limits the total number of pending records (and optionally
-// bytes) across all shards. Each shard must acquire space from this pool before
-// accepting records from Kinesis, ensuring bounded memory usage regardless of
-// shard count.
+// globalPendingPool limits the total number of pending records and bytes across
+// all shards. Each shard must acquire space from this pool before accepting
+// records from Kinesis, ensuring bounded memory usage regardless of shard count.
 //
 // When maxBytes > 0, both the record count limit and the byte limit apply —
 // whichever is reached first triggers backpressure. When maxBytes == 0, only
@@ -186,6 +185,35 @@ func (p *globalPendingPool) WaitForSpace(ctx context.Context, timeout time.Durat
 	}
 
 	return WaitForSpaceOK
+}
+
+// ConvertReservation atomically converts a byte reservation into actual record
+// tracking. This is used after reading an EFO event: the shard held a byte
+// reservation before reading, and now swaps it for the actual record count and
+// byte size of the event.
+//
+// The byte adjustment is (actualBytes - reservationBytes):
+//   - If actual < reservation: net release of bytes (frees pool space, wakes waiters)
+//   - If actual > reservation: net acquire of bytes (pool grows, never blocks)
+//   - If actual == reservation: no byte change
+//
+// This method never blocks and never fails. If the event is larger than the
+// reservation, the pool may temporarily exceed its byte limit. Subsequent
+// Acquire calls will enforce the limit and apply backpressure.
+func (p *globalPendingPool) ConvertReservation(count, actualBytes, reservationBytes int) {
+	p.mu.Lock()
+	p.current += count
+	p.currentBytes += actualBytes - reservationBytes
+	if p.currentBytes < 0 {
+		p.currentBytes = 0
+	}
+	freed := actualBytes < reservationBytes
+	p.mu.Unlock()
+
+	// Only broadcast if we freed space — avoids unnecessary wakeups
+	if freed {
+		p.cond.Broadcast()
+	}
 }
 
 // Release returns count records and bytes worth of space back to the pool.
