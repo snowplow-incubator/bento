@@ -22,7 +22,8 @@ type shardConsumerMode int
 
 const (
 	releaseEarly    shardConsumerMode = iota // old: release when pending → batcher
-	releaseDeferred                          // new: release when batcher → msgChan
+	releaseDeferred                          // mid: release when batcher → msgChan
+	releaseOnAck                             // new: release when output acks (end-to-end)
 )
 
 // efoLoadTestConfig holds all tunables for the load simulation.
@@ -140,6 +141,8 @@ func runEFOLoadTest(t *testing.T, cfg efoLoadTestConfig, testDuration time.Durat
 		// memory tracking realistic — without it the GC would collect the
 		// payloads immediately after they leave the batcher.
 		data [][]byte
+		// ackFn is called after the output "processes" the batch (releaseOnAck mode).
+		ackFn func()
 	}
 	msgChan := make(chan flushedBatch, 100)
 
@@ -154,6 +157,9 @@ func runEFOLoadTest(t *testing.T, cfg efoLoadTestConfig, testDuration time.Durat
 			totalBytesConsumed.Add(int64(batch.bytes))
 			_ = batch.data // keep data live until after sleep
 			time.Sleep(cfg.outputLatency)
+			if batch.ackFn != nil {
+				batch.ackFn() // release pool space on ack
+			}
 		}
 	}()
 
@@ -299,10 +305,14 @@ func runEFOLoadTest(t *testing.T, cfg efoLoadTestConfig, testDuration time.Durat
 						bytes: batcherBytes,
 						data:  batcherData,
 					}
+					if cfg.mode == releaseOnAck {
+						// End-to-end: pool released by output consumer on ack
+						rc, rb := batcherCount, batcherBytes
+						batch.ackFn = func() { pool.Release(rc, rb) }
+					}
 					select {
 					case msgChan <- batch:
 						if cfg.mode == releaseDeferred {
-							// NEW behaviour: release pool space on flush
 							pool.Release(batcherCount, batcherBytes)
 						}
 						batcherCount = 0
@@ -322,8 +332,13 @@ func runEFOLoadTest(t *testing.T, cfg efoLoadTestConfig, testDuration time.Durat
 						if !ok {
 							// Subscription closed — flush remaining and exit
 							if batcherCount > 0 {
+								fb := flushedBatch{count: batcherCount, bytes: batcherBytes, data: batcherData}
+								if cfg.mode == releaseOnAck {
+									rc, rb := batcherCount, batcherBytes
+									fb.ackFn = func() { pool.Release(rc, rb) }
+								}
 								select {
-								case msgChan <- flushedBatch{count: batcherCount, bytes: batcherBytes, data: batcherData}:
+								case msgChan <- fb:
 									if cfg.mode == releaseDeferred {
 										pool.Release(batcherCount, batcherBytes)
 									}
@@ -438,9 +453,22 @@ func TestEFOLoadSimulation_EarlyVsDeferred(t *testing.T) {
 		cfg := baseCfg
 		cfg.mode = releaseDeferred
 		res := runEFOLoadTest(t, cfg, duration)
-		logResult(t, "DEFERRED RELEASE (new behaviour)", cfg, res, duration)
+		logResult(t, "DEFERRED RELEASE (mid)", cfg, res, duration)
 
-		// With deferred release, pool accurately reflects in-memory data
+		require.LessOrEqual(t, res.peakPoolBytes, int64(cfg.maxPendingBytes),
+			"pool bytes exceeded maximum")
+	})
+
+	runtime.GC()
+
+	t.Run("release_on_ack", func(t *testing.T) {
+		cfg := baseCfg
+		cfg.mode = releaseOnAck
+		res := runEFOLoadTest(t, cfg, duration)
+		logResult(t, "RELEASE ON ACK (end-to-end)", cfg, res, duration)
+
+		// With end-to-end tracking, pool should reflect ALL in-flight data
+		// including data in the output pipeline
 		require.LessOrEqual(t, res.peakPoolBytes, int64(cfg.maxPendingBytes),
 			"pool bytes exceeded maximum")
 	})

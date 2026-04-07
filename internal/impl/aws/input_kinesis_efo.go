@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -199,10 +200,14 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 	var pendingBytes int
 
 	// Track records moved into the batcher but not yet flushed to msgChan.
-	// Pool space is held until the batched message is sent downstream, so
-	// backpressure accounts for batcher + pending memory, not just pending.
 	var batcherCount int
 	var batcherBytes int
+
+	// Track records sent to the pipeline (msgChan) but not yet acknowledged.
+	// Pool space is held until the output acks, so backpressure accounts for
+	// the full lifecycle: pending + batcher + in-flight pipeline data.
+	var inFlightCount atomic.Int64
+	var inFlightBytes atomic.Int64
 
 	// Channels for subscription control
 	subscriptionTrigger := make(chan string, 1) // Trigger for initial subscription or resubscription
@@ -219,9 +224,16 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 			commitCtxClose()
 			recordBatcher.Close(context.Background(), state == awsKinesisConsumerFinished)
 
-			// Release any remaining pending records and batcher records back to the global pool
-			if len(pending) > 0 || batcherCount > 0 {
-				k.globalPendingPool.Release(len(pending)+batcherCount, pendingBytes+batcherBytes)
+			// Release any remaining pool space: pending + batcher + in-flight pipeline data.
+			// On normal shutdown, in-flight ackFns may have already released their share
+			// (atomic counters track this). On hard stop, ackFns may not fire, so this
+			// defer acts as the safety net. The pool clamps to zero on over-release.
+			remainingInFlight := int(inFlightCount.Load())
+			remainingInFlightBytes := int(inFlightBytes.Load())
+			totalRelease := len(pending) + batcherCount + remainingInFlight
+			totalReleaseBytes := pendingBytes + batcherBytes + remainingInFlightBytes
+			if totalRelease > 0 || totalReleaseBytes > 0 {
+				k.globalPendingPool.Release(totalRelease, totalReleaseBytes)
 			}
 
 			reason := ""
@@ -413,8 +425,26 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 				}
 			}
 
-			// Decide whether to flush
+			// Decide whether to flush. Wrap ackFn once so pool.Release fires
+			// when the pipeline acks, not when the message is sent to msgChan.
 			if pendingMsg.msg != nil {
+				if batcherCount > 0 {
+					releaseCount := batcherCount
+					releaseBytes := batcherBytes
+					originalAckFn := pendingMsg.ackFn
+					pendingMsg.ackFn = func(ctx context.Context, err error) error {
+						k.globalPendingPool.Release(releaseCount, releaseBytes)
+						inFlightCount.Add(-int64(releaseCount))
+						inFlightBytes.Add(-int64(releaseBytes))
+						return originalAckFn(ctx, err)
+					}
+					// Move batcher tracking to in-flight now — the wrapped ackFn
+					// captures these values and will release them on ack.
+					inFlightCount.Add(int64(batcherCount))
+					inFlightBytes.Add(int64(batcherBytes))
+					batcherCount = 0
+					batcherBytes = 0
+				}
 				nextFlushChan = k.msgChan
 			} else {
 				nextFlushChan = nil
@@ -461,13 +491,6 @@ func (k *kinesisReader) runEFOConsumer(wg *sync.WaitGroup, info streamInfo, shar
 
 			case nextFlushChan <- pendingMsg:
 				pendingMsg = asyncMessage{}
-				// Release pool space now that the message has been handed downstream.
-				// This is the point where data leaves our local buffers.
-				if batcherCount > 0 {
-					k.globalPendingPool.Release(batcherCount, batcherBytes)
-					batcherCount = 0
-					batcherBytes = 0
-				}
 
 			case records := <-nextRecordsChan:
 				// Received records from subscription
