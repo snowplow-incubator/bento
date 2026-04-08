@@ -41,23 +41,15 @@ const (
 	kiFieldEnhancedFanOut  = "enhanced_fan_out"
 
 	// Enhanced Fan Out Fields
-	kiEFOFieldEnabled                   = "enabled"
-	kiEFOFieldConsumerName              = "consumer_name"
-	kiEFOFieldConsumerARN               = "consumer_arn"
-	kiEFOFieldRecordBufferCap           = "record_buffer_cap"
-	kiEFOFieldMaxPendingRecordsGlobal   = "max_pending_records"
-	kiEFOFieldMaxPendingBytes           = "max_pending_bytes"
-	kiEFOFieldShardReadReservationBytes = "shard_read_reservation_bytes"
+	kiEFOFieldEnabled      = "enabled"
+	kiEFOFieldConsumerName = "consumer_name"
+	kiEFOFieldConsumerARN  = "consumer_arn"
 )
 
 type kiEFOConfig struct {
-	Enabled                 bool
-	ConsumerName            string
-	ConsumerARN             string
-	RecordBufferCap         int
-	MaxPendingRecordsGlobal int
-	MaxPendingBytes         int
-	ShardReadReservationBytes int
+	Enabled      bool
+	ConsumerName string
+	ConsumerARN  string
 }
 
 type kiConfig struct {
@@ -105,34 +97,6 @@ func kinesisInputConfigFromParsed(pConf *service.ParsedConfig) (conf kiConfig, e
 			return
 		}
 		if efoConf.ConsumerARN, err = efoNs.FieldString(kiEFOFieldConsumerARN); err != nil {
-			return
-		}
-		if efoConf.RecordBufferCap, err = efoNs.FieldInt(kiEFOFieldRecordBufferCap); err != nil {
-			return
-		}
-		if efoConf.RecordBufferCap < 0 {
-			err = errors.New("enhanced_fan_out.record_buffer_cap must be at least 0")
-			return
-		}
-		if efoConf.MaxPendingRecordsGlobal, err = efoNs.FieldInt(kiEFOFieldMaxPendingRecordsGlobal); err != nil {
-			return
-		}
-		if efoConf.MaxPendingRecordsGlobal < 1 {
-			err = errors.New("enhanced_fan_out.max_pending_records must be at least 1")
-			return
-		}
-		if efoConf.MaxPendingBytes, err = efoNs.FieldInt(kiEFOFieldMaxPendingBytes); err != nil {
-			return
-		}
-		if efoConf.MaxPendingBytes < 1 {
-			err = errors.New("enhanced_fan_out.max_pending_bytes must be at least 1")
-			return
-		}
-		if efoConf.ShardReadReservationBytes, err = efoNs.FieldInt(kiEFOFieldShardReadReservationBytes); err != nil {
-			return
-		}
-		if efoConf.ShardReadReservationBytes < 0 {
-			err = errors.New("enhanced_fan_out.shard_read_reservation_bytes must be at least 0")
 			return
 		}
 		conf.EnhancedFanOut = efoConf
@@ -216,22 +180,6 @@ Use the `+"`batching`"+` fields to configure an optional [batching policy](/docs
 				Description("Existing consumer ARN to use. If provided, skips registration.").
 				Default("").
 				Advanced(),
-			service.NewIntField(kiEFOFieldRecordBufferCap).
-				Description("Buffer capacity for the internal records channel per shard. Lower values reduce memory usage when processing many shards. Set to 0 for unbuffered channel (minimal memory footprint).").
-				Default(0).
-				Advanced(),
-			service.NewIntField(kiEFOFieldMaxPendingRecordsGlobal).
-				Description("Maximum total number of records to buffer across all shards before applying backpressure to Kinesis subscriptions. This provides a global bound regardless of shard count. When both max_pending_records and max_pending_bytes are set, whichever limit is reached first triggers backpressure.").
-				Default(50000).
-				Advanced(),
-			service.NewIntField(kiEFOFieldMaxPendingBytes).
-				Description("Maximum total bytes to buffer across all shards before applying backpressure to Kinesis subscriptions. This provides a hard memory bound since Kinesis records can be up to 1 MB each. When both max_pending_records and max_pending_bytes are set, whichever limit is reached first triggers backpressure. Set to 0 to disable byte-level accounting and rely solely on max_pending_records.").
-				Default(0).
-				Advanced(),
-			service.NewIntField(kiEFOFieldShardReadReservationBytes).
-				Description("Byte reservation each shard must acquire from the global byte pool before subscribing to Kinesis. Controls how many shards can receive data concurrently: effective limit ≈ max_pending_bytes / shard_read_reservation_bytes. After initial events are observed, the reservation size adapts automatically to match actual event sizes using a global rolling average. This value serves as the initial reservation before any data has been received. Set to 0 to disable reservation-based concurrency control (all shards read freely).").
-				Default(0).
-				Advanced(),
 		).
 			Description("Enhanced Fan Out configuration for push-based streaming. Provides dedicated 2 MB/sec throughput per consumer per shard and lower latency (~70ms). Note: EFO incurs per shard-hour charges.").
 			Version("1.16.0").
@@ -287,11 +235,9 @@ type kinesisReader struct {
 
 	boffPool sync.Pool
 
-	svc               *kinesis.Client
-	checkpointer      *awsKinesisCheckpointer
-	efoEnabled        bool
-	globalPendingPool *globalPendingPool
-	eventSizeAvg      *eventSizeAverage
+	svc          *kinesis.Client
+	checkpointer *awsKinesisCheckpointer
+	efoEnabled   bool
 
 	streams []*streamInfo
 
@@ -426,10 +372,7 @@ func newKinesisReaderFromConfig(conf kiConfig, batcher service.BatchPolicy, sess
 	// Check if Enhanced Fan Out is enabled
 	if k.conf.EnhancedFanOut != nil && k.conf.EnhancedFanOut.Enabled {
 		k.efoEnabled = true
-		k.globalPendingPool = newGlobalPendingPool(k.conf.EnhancedFanOut.MaxPendingRecordsGlobal, k.conf.EnhancedFanOut.MaxPendingBytes)
-		k.log.Debugf("Enhanced Fan Out enabled with global pending pool max: %d records, %d bytes", k.conf.EnhancedFanOut.MaxPendingRecordsGlobal, k.conf.EnhancedFanOut.MaxPendingBytes)
-
-		k.eventSizeAvg = newEventSizeAverage(0.1)
+		k.log.Debugf("Enhanced Fan Out enabled")
 	}
 
 	return &k, nil
