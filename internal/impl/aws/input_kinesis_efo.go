@@ -443,6 +443,9 @@ func (k *kinesisReader) efoSubscribeAndProcess(
 			}
 
 			if lost := k.renewLease(ctx, info, shardID, recordBatcher, state, commitCtx, commitCtxClose); lost {
+				// See sendToPipeline: an unsent batch is dropped on lease loss
+				// so the consumer's exit drain cannot block on a full pipeline.
+				*pendingMsg = asyncMessage{}
 				return continuationSeq, false, nil
 			}
 
@@ -519,9 +522,20 @@ func (k *kinesisReader) checkpoint(ctx context.Context, streamID, shardID, seque
 // shard. The original consumer stays blocked here holding a decoded batch, so
 // every such generation leaks memory until the pod is OOM killed.
 //
-// Returns false if the lease was lost or the context was cancelled, in which
-// case pendingMsg is left intact for the caller to deal with. Inspect state to
-// tell the two apart: a lost lease sets awsKinesisConsumerYielding.
+// Returns false if the lease was lost or the context was cancelled. Inspect
+// state to tell the two apart: a lost lease sets awsKinesisConsumerYielding.
+//
+// On lease loss the unsent message is dropped rather than retained. Another
+// client owns the shard now, so there is nothing useful we can do with the
+// batch, and holding it would leave the consumer's exit drain blocked on the
+// same full pipeline that cost us the lease — which in turn would stop the
+// deferred cleanup from yielding the checkpoint or deregistering the shard.
+// Dropping it is safe for delivery guarantees: the yielded checkpoint uses the
+// acked sequence, which by definition sits before anything unsent, so the new
+// owner reprocesses these records.
+//
+// On context cancellation the message is left intact, since the shutdown drain
+// still has a chance to flush it.
 func (k *kinesisReader) sendToPipeline(
 	ctx context.Context,
 	info streamInfo,
@@ -543,6 +557,9 @@ func (k *kinesisReader) sendToPipeline(
 				return false
 			}
 			if lost := k.renewLease(ctx, info, shardID, recordBatcher, state, commitCtx, commitCtxClose); lost {
+				// Drop the batch: the shard is someone else's now, and keeping
+				// it would block this consumer's exit drain indefinitely.
+				*pendingMsg = asyncMessage{}
 				return false
 			}
 

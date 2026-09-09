@@ -131,7 +131,58 @@ func TestSendToPipelineStopsWhenLeaseLost(t *testing.T) {
 	}
 
 	assert.Equal(t, awsKinesisConsumerYielding, state, "consumer should be marked as yielding")
-	assert.NotNil(t, pendingMsg.msg, "pendingMsg should be left intact for the caller")
+
+	// The batch is dropped rather than retained. Holding it would leave the
+	// consumer's exit drain blocked on the same full pipeline that cost us the
+	// lease, so the goroutine would never exit and its deferred cleanup would
+	// never yield the checkpoint or deregister the shard. Dropping is safe
+	// because the yielded checkpoint uses the acked sequence, which sits before
+	// anything unsent.
+	assert.Nil(t, pendingMsg.msg, "unsent batch should be dropped when the lease is lost")
+}
+
+// TestConsumerExitDrainDoesNotBlockAfterLeaseLoss is the reason the batch is
+// dropped above: it reproduces the exit path a consumer takes after losing its
+// lease, with the pipeline still full, and checks it can finish.
+func TestConsumerExitDrainDoesNotBlockAfterLeaseLoss(t *testing.T) {
+	const commitPeriod = 20 * time.Millisecond
+
+	k := newLeaseTestReader(commitPeriod, func(context.Context, string, string, string) (bool, error) {
+		return false, nil // lease gone
+	})
+	defer k.done()
+
+	batcher := newLeaseTestBatcher(t, k)
+	info := streamInfo{id: "test-stream"}
+	state := awsKinesisConsumerConsuming
+	commitCtx, commitCtxClose := context.WithTimeout(k.ctx, commitPeriod)
+	defer commitCtxClose()
+
+	pendingMsg := asyncMessage{msg: service.MessageBatch{service.NewMessage([]byte("hello"))}}
+
+	// Lose the lease while blocked on a pipeline nobody is draining.
+	require.False(t, k.sendToPipeline(k.ctx, info, "shard-0", batcher, &pendingMsg, &state, &commitCtx, &commitCtxClose))
+	require.Equal(t, awsKinesisConsumerYielding, state)
+
+	// This mirrors the tail drain in runEFOConsumer. With the batch dropped it
+	// is a no-op; if the batch were retained it would block until shutdown and
+	// the consumer's deferred cleanup would never run.
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		if pendingMsg.msg != nil {
+			select {
+			case k.msgChan <- pendingMsg:
+			case <-k.ctx.Done():
+			}
+		}
+	}()
+
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("consumer exit drain blocked after lease loss; the unsent batch was not dropped")
+	}
 }
 
 // TestSendToPipelineStopsOnShutdown checks the shutdown path still works.
