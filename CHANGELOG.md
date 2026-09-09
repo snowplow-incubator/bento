@@ -9,6 +9,10 @@ All notable changes to this project will be documented in this file.
 
 - `send_queue_capacity`, `buf_pool_capacity` & `send_loop_count` fields on the `statsd` metrics exporter to tune the underlying `go-statsd` client and avoid packet loss under high throughput @triddell
 
+### Fixed
+
+- `aws_kinesis` input with `enhanced_fan_out` no longer accumulates duplicate shard consumers when the pipeline applies sustained backpressure, which previously grew memory usage until the process was killed @matus-tomlein
+
 ## 1.21.1 - 2026-08-26
 
 ### Fixed
