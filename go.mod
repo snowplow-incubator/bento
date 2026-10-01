@@ -159,7 +159,7 @@ require (
 	golang.org/x/sync v0.18.0
 	golang.org/x/text v0.31.0
 	google.golang.org/api v0.247.0
-	google.golang.org/grpc v1.77.0
+	google.golang.org/grpc v1.82.2
 	google.golang.org/protobuf v1.36.10
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
